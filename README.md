@@ -21,7 +21,7 @@ Importá `mysql-schema.sql` en MySQL/phpMyAdmin antes de iniciar la API y config
 
 ## Render
 
-Si desplegás el repositorio completo, configurá `backend` como **Root Directory** del servicio. Si subís esta carpeta como un repositorio separado, usá estos valores:
+Este repositorio ya contiene la API en su raíz. Si configurás **Root Directory** en Render, dejalo vacío; después usá estos valores:
 
 - Build Command: `npm install`
 - Start Command: `npm start`
