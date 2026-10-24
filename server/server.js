@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { scryptSync, timingSafeEqual, randomUUID, createHash } from 'node:crypto'
+import cors from 'cors'
 import { addAudit, dashboard, describeAudit, enrichDocument, getExpirations, isVehicleDocumentationIncomplete, todayIso } from './domain.js'
 import { passwordRecord, readStore, uploadsDir, writeStore, withStoreTransaction } from './store.js'
 import { csvEscape, parseCsv, validateDocument, validateSettings, validateVehicle, validateDocumentType, validateBooleans, integer, invalid, ValidationError } from './validation.js'
@@ -12,9 +13,38 @@ import { buildEmailReport, createMailer, deliverEmail, emailConfig, logSmtpError
 const port = Number(process.env.PORT || 3000)
 const tokenHash = (token) => createHash('sha256').update(token).digest('hex')
 
+function parseCorsOrigins(value = process.env.CORS_ORIGINS) {
+  const origins = String(value || '').split(',').map((origin) => origin.trim()).filter(Boolean)
+  return !origins.length || origins.includes('*') ? '*' : origins
+}
+
+function createCorsMiddleware(origins) {
+  return cors({
+    origin: origins,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    exposedHeaders: ['Content-Disposition'],
+    maxAge: 600,
+    // El paquete refleja los encabezados solicitados, incluyendo Authorization
+    // y cualquier encabezado personalizado usado por el frontend.
+    allowedHeaders: undefined,
+    optionsSuccessStatus: 204,
+  })
+}
+
+function applyCors(req, res, middleware) {
+  let nextCalled = false
+  let middlewareError
+  middleware(req, res, (error) => {
+    middlewareError = error
+    nextCalled = true
+  })
+  if (middlewareError) throw middlewareError
+  return nextCalled
+}
+
 function send(res, status, payload, headers = {}) {
   const isText = typeof payload === 'string'
-  res.writeHead(status, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Content-Type': isText ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8', ...headers })
+  res.writeHead(status, { 'Content-Type': isText ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8', ...headers })
   res.end(isText ? payload : JSON.stringify(payload))
 }
 
@@ -127,7 +157,6 @@ function csvResponse(res, rows, filename) {
 
 async function handle(req, res, context = { readStore, writeStore, now: Date.now, sessionTtlMs: 43200000 }, providedBody) {
   const { readStore, writeStore, now, sessionTtlMs } = context
-  if (req.method === 'OPTIONS') return send(res, 204, '')
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
   const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent)
   const api = parts[0] === 'api'
@@ -188,6 +217,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   }
   if (req.method === 'POST' && parts[1] === 'auth' && parts[2] === 'logout') {
     const token = String(req.headers.authorization || '').replace(/^Bearer /, '')
+    if (!token) return send(res, 200, { ok: true })
     store.sessions = store.sessions.filter((session) => session.id !== tokenHash(token))
     await writeStore(store)
     return send(res, 200, { ok: true })
@@ -721,9 +751,10 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   return error(res, 404, 'Ruta no encontrada')
 }
 
-export function createApiServer({ readStore: loadStore = readStore, writeStore: saveStore = writeStore, mailer = createMailer(), emailScheduler = false, now = Date.now, sessionTtlMs = 43200000, withTransaction = loadStore === readStore ? withStoreTransaction : (work) => work() } = {}) {
+export function createApiServer({ readStore: loadStore = readStore, writeStore: saveStore = writeStore, mailer = createMailer(), emailScheduler = false, now = Date.now, sessionTtlMs = 43200000, corsOrigins = parseCorsOrigins(), withTransaction = loadStore === readStore ? withStoreTransaction : (work) => work() } = {}) {
   if (!Number.isSafeInteger(sessionTtlMs) || sessionTtlMs <= 0) throw new Error('La duración de sesión debe ser un entero positivo')
   const context = { readStore: loadStore, writeStore: saveStore, mailer, now, sessionTtlMs }
+  const corsMiddleware = createCorsMiddleware(corsOrigins)
   let mutations = Promise.resolve()
   async function dispatch(req, res) {
     // El preflight CORS no depende de la base: si MySQL falla, el navegador debe ver el error real y no uno de CORS.
@@ -739,7 +770,17 @@ export function createApiServer({ readStore: loadStore = readStore, writeStore: 
     mutations = response.catch(() => {})
     return response
   }
-  const apiServer = createServer((req, res) => dispatch(req, res).catch((caught) => error(res, caught.statusCode || (caught instanceof SyntaxError || caught.message?.includes('obligatorio') || caught.message?.includes('válido') ? 400 : 500), caught.message || 'Error interno')))
+  const apiServer = createServer((req, res) => {
+    try {
+      // CORS se aplica a todas las rutas, archivos y errores antes del router,
+      // de leer el cuerpo o de intentar abrir una conexión con MySQL.
+      const nextCalled = applyCors(req, res, corsMiddleware)
+      if (req.method === 'OPTIONS' || !nextCalled) return
+      dispatch(req, res).catch((caught) => error(res, caught.statusCode || (caught instanceof SyntaxError || caught.message?.includes('obligatorio') || caught.message?.includes('válido') ? 400 : 500), caught.message || 'Error interno'))
+    } catch (caught) {
+      error(res, caught.statusCode || 500, caught.message || 'Error interno')
+    }
+  })
   // El programador comparte la cola de escrituras de la API y nunca guarda una copia vieja.
   let scheduledPending = false
   const tick = () => {
