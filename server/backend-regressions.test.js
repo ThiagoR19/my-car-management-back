@@ -35,9 +35,10 @@ function fixture(overrides = {}) {
       const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))])
       Object.assign(req, { method, url: `/api${path}`, headers: { host: 'localhost', ...(body !== undefined && { 'content-type': 'application/json' }), ...(token && { authorization: `Bearer ${token}` }) } })
       let status
-      let headers
+      let headers = {}
       const res = {
-        writeHead(code, nextHeaders) { status = code; headers = nextHeaders },
+        setHeader(name, value) { headers[name] = value },
+        writeHead(code, nextHeaders) { status = code; Object.assign(headers, nextHeaders) },
         end(raw) {
           const text = String(raw ?? '')
           resolve({ status, headers, body: headers['Content-Type']?.includes('application/json') ? JSON.parse(text) : text })
