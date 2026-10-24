@@ -139,3 +139,18 @@ test('la migración MySQL incluye las tablas y restricciones de la aplicación',
   assert.ok(tables.includes('sessions'))
   assert.match(readFileSync(new URL('../drizzle/migrations/0000_initial_mysql.sql', import.meta.url), 'utf8'), /GENERATED ALWAYS AS/)
 })
+
+test('mysqlConfig activa TLS solo cuando la URL o la CA lo piden', async () => {
+  const { mysqlConfig } = await import('./store.js')
+  const plain = mysqlConfig('mysql://user:p%40ss@localhost:3306/base', '')
+  assert.equal(plain.ssl, undefined)
+  assert.equal(plain.password, 'p@ss')
+  assert.equal(plain.database, 'base')
+  const required = mysqlConfig('mysql://user:pass@mysql-x.aivencloud.com:12345/defaultdb?ssl-mode=REQUIRED', '')
+  assert.deepEqual(required.ssl, { rejectUnauthorized: true, minVersion: 'TLSv1.2' })
+  assert.equal(required.database, 'defaultdb')
+  assert.equal(required.port, 12345)
+  const withCa = mysqlConfig('mysql://user:pass@host/base', '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----')
+  assert.equal(withCa.ssl.ca, '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----')
+  assert.equal(withCa.ssl.rejectUnauthorized, true)
+})

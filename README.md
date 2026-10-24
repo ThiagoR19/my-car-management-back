@@ -29,7 +29,8 @@ Este repositorio ya contiene la API en su raíz. Si configurás **Root Directory
 
 Variables obligatorias:
 
-- `DATABASE_URL`: URL de conexión MySQL.
+- `DATABASE_URL`: URL de conexión MySQL. La base tiene que aceptar conexiones desde internet: un hosting compartido que solo expone `localhost` no sirve. Para bases en la nube como Aiven, agregá `?ssl-mode=REQUIRED` al final de la URL.
+- `DATABASE_CA_CERT`: solo si el proveedor usa una CA propia (Aiven): pegá el contenido completo del `ca.pem`.
 - Variables `SMTP_*` de `.env.example` si vas a usar alertas por correo.
 
 Después del primer despliegue, importá el esquema en la base y ejecutá una vez `npm run setup:admin` con las variables `BOOTSTRAP_ADMIN_*`. Eliminá esas variables después de crear el administrador.

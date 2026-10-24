@@ -17,11 +17,21 @@ function isTaggedClient(client) {
   return typeof client === 'function'
 }
 
-function mysqlConfig(urlValue) {
+// Las bases en la nube (Aiven, TiDB, etc.) exigen TLS: se activa con ?ssl-mode=REQUIRED en la URL
+// y, si el proveedor usa una CA propia, se valida con el PEM de DATABASE_CA_CERT.
+function sslConfig(url, caCert) {
+  const mode = (url.searchParams.get('ssl-mode') || url.searchParams.get('sslmode') || '').toUpperCase()
+  if (!caCert && !['REQUIRED', 'REQUIRE', 'VERIFY_CA', 'VERIFY_IDENTITY', 'VERIFY-FULL'].includes(mode)) return undefined
+  return { rejectUnauthorized: true, minVersion: 'TLSv1.2', ...(caCert ? { ca: caCert.replaceAll('\\n', '\n') } : {}) }
+}
+
+export function mysqlConfig(urlValue, caCert = process.env.DATABASE_CA_CERT) {
   if (!urlValue) throw new Error('DATABASE_URL es obligatorio para usar MyCarManagement')
   const url = new URL(urlValue)
   if (!['mysql:', 'mysql2:'].includes(url.protocol)) throw new Error('DATABASE_URL debe usar el formato mysql://usuario:contrasena@host:3306/base')
+  const ssl = sslConfig(url, caCert?.trim())
   return {
+    ...(ssl ? { ssl } : {}),
     host: url.hostname,
     port: url.port ? Number(url.port) : 3306,
     user: decodeURIComponent(url.username),

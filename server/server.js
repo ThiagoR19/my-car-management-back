@@ -726,6 +726,8 @@ export function createApiServer({ readStore: loadStore = readStore, writeStore: 
   const context = { readStore: loadStore, writeStore: saveStore, mailer, now, sessionTtlMs }
   let mutations = Promise.resolve()
   async function dispatch(req, res) {
+    // El preflight CORS no depende de la base: si MySQL falla, el navegador debe ver el error real y no uno de CORS.
+    if (req.method === 'OPTIONS') return send(res, 204, '')
     const hasBody = ['POST', 'PUT', 'DELETE'].includes(req.method)
     const parts = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname.split('/').filter(Boolean).map(decodeURIComponent)
     // GET notifications también guarda el estado al generar avisos.
