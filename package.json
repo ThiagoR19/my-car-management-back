@@ -1,0 +1,21 @@
+{
+  "name": "my-car-management-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "node --watch server/server.js",
+    "setup:admin": "node server/bootstrap.js",
+    "test": "node --test server/*.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.5",
+    "drizzle-orm": "^0.45.3",
+    "mysql2": "^3.24.6",
+    "nodemailer": "^10.1.7"
+  }
+}

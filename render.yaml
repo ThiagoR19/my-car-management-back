@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: my-car-management-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
