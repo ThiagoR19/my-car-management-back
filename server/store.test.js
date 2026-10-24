@@ -9,7 +9,7 @@ import { readStore, writeStore } from './store.js'
 // adapter only binds tagged-template parameters and maps driver value types; it
 // does not simulate persistence behavior. The MySQL migration remains the
 // source of the relational table layout.
-function isolatedDatabase(snapshotName = '0000_snapshot.json') {
+function isolatedDatabase(snapshotName = '0000_snapshot.json', { rawBooleans = false } = {}) {
   const database = new DatabaseSync(':memory:')
   database.exec('PRAGMA foreign_keys = ON')
   const snapshot = JSON.parse(readFileSync(new URL(`../drizzle/migrations/meta/${snapshotName}`, import.meta.url), 'utf8'))
@@ -27,7 +27,7 @@ function isolatedDatabase(snapshotName = '0000_snapshot.json') {
   }
   const encode = (value) => value instanceof Date ? value.toISOString() : typeof value === 'boolean' ? Number(value) : value && typeof value === 'object' ? JSON.stringify(value) : value
   const decode = (row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
-    value === null ? null : ['active', 'read', 'requiresExpiration'].includes(key) ? Boolean(value) : ['data', 'requiredDocumentTypeIds', 'emailAlerts', 'parts'].includes(key) ? JSON.parse(value) : /At$/.test(key) || ['issueDate', 'expirationDate'].includes(key) ? new Date(value) : value,
+    value === null ? null : !rawBooleans && ['active', 'read', 'requiresExpiration'].includes(key) ? Boolean(value) : ['data', 'requiredDocumentTypeIds', 'emailAlerts', 'parts'].includes(key) ? JSON.parse(value) : /At$/.test(key) || ['issueDate', 'expirationDate'].includes(key) ? new Date(value) : value,
   ]))
   const client = (strings, ...values) => {
     if (typeof strings === 'string') return { identifier: strings }
@@ -83,6 +83,26 @@ test('conserva más de 100 auditorías, incluso cuando un guardado no incluye to
   addAudit(loaded, loaded.employees[0], 'updated', 'vehicle', 'v')
   await writeStore(loaded, client)
   assert.equal((await readStore(client)).audit.length, 151)
+})
+
+test('los booleanos que MySQL devuelve como 0/1 se leen como true/false', async (t) => {
+  // mysql2 entrega BOOLEAN (TINYINT(1)) como número; el login exige employee.active === true.
+  const { database, client } = isolatedDatabase(undefined, { rawBooleans: true })
+  t.after(() => database.close())
+  const initial = fixture()
+  initial.employees[1].active = false
+  initial.notifications = [{ id: 'n', title: 'Aviso', description: '', type: 'info', read: true }]
+  await writeStore(initial, client)
+  const loaded = await readStore(client)
+  assert.deepEqual(loaded.employees.map((employee) => employee.active), [true, false])
+  assert.equal(loaded.vehicleTypes[0].active, true)
+  assert.equal(loaded.documentTypes[0].active, true)
+  assert.equal(loaded.documentTypes[0].requiresExpiration, true)
+  assert.equal(loaded.documents[0].active, true)
+  assert.equal(loaded.notifications[0].read, true)
+  loaded.employees[0].name = 'Admin renombrado'
+  await writeStore(loaded, client)
+  assert.equal((await readStore(client)).employees[0].active, true)
 })
 
 test('el autor histórico permanece al renombrar o eliminar al empleado', async (t) => {

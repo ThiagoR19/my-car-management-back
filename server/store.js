@@ -109,6 +109,8 @@ const databaseStatusToApp = { ACTIVO: 'Activo', EN_MANTENIMIENTO: 'En mantenimie
 const appStatusToDatabase = Object.fromEntries(Object.entries(databaseStatusToApp).map(([key, value]) => [value, key]))
 const dateValue = (value) => value instanceof Date ? value.toISOString().slice(0, 10) : value
 const timestampValue = (value) => value ? new Date(value) : new Date()
+// MySQL guarda BOOLEAN como TINYINT(1) y mysql2 lo devuelve como 0/1: la app compara con true/false.
+const booleanValue = (value) => value === true || value === 1 || value === '1'
 const parseJson = (value, fallback = null) => {
   if (value === null || value === undefined) return fallback
   if (typeof value !== 'string') return value
@@ -119,14 +121,14 @@ function mapDatabaseStore(rows) {
   const { employees, accessRequests, vehicleTypes, documentTypes, vehicles, documents, documentFiles, notifications, audits, settings, parts = [], repairs = [], sessions = [] } = rows
   const filesByDocument = Object.fromEntries(documentFiles.map((file) => [file.documentId, { fileId: file.id, fileName: file.fileName, filePath: file.storageKey, mimeType: file.mimeType, sizeBytes: file.sizeBytes }]))
   return {
-    employees: employees.map((employee) => ({ ...employee, role: employee.role === 'ADMINISTRADOR' ? 'Administrador' : 'Empleado' })),
+    employees: employees.map((employee) => ({ ...employee, role: employee.role === 'ADMINISTRADOR' ? 'Administrador' : 'Empleado', active: booleanValue(employee.active) })),
     accessRequests,
     sessions,
-    vehicleTypes: vehicleTypes.map((type) => ({ ...type, requiredDocumentTypeIds: parseJson(type.requiredDocumentTypeIds, []) })),
-    documentTypes,
+    vehicleTypes: vehicleTypes.map((type) => ({ ...type, active: booleanValue(type.active), requiredDocumentTypeIds: parseJson(type.requiredDocumentTypeIds, []) })),
+    documentTypes: documentTypes.map((type) => ({ ...type, active: booleanValue(type.active), requiresExpiration: booleanValue(type.requiresExpiration) })),
     vehicles: vehicles.map((vehicle) => ({ ...vehicle, status: databaseStatusToApp[vehicle.status] || vehicle.status })),
-    documents: documents.map((document) => ({ ...document, ...filesByDocument[document.id], issueDate: dateValue(document.issueDate), expirationDate: dateValue(document.expirationDate), notes: document.observations || '' })),
-    notifications,
+    documents: documents.map((document) => ({ ...document, ...filesByDocument[document.id], active: booleanValue(document.active), issueDate: dateValue(document.issueDate), expirationDate: dateValue(document.expirationDate), notes: document.observations || '' })),
+    notifications: notifications.map((notification) => ({ ...notification, read: booleanValue(notification.read) })),
     audit: audits.map((audit) => ({ ...audit, data: parseJson(audit.data) })),
     settings: settings[0] ? { ...settings[0], emailAlerts: parseJson(settings[0].emailAlerts, {}) } : { firstAlertDays: 30, secondAlertDays: 15, urgentDays: 7, companyName: 'MyCarManagement', timezone: 'America/Argentina/Buenos_Aires', emailAlerts: {} },
     parts,
