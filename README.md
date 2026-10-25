@@ -15,9 +15,15 @@ Comandos disponibles:
 - `npm run start`: inicia la API en el puerto definido por `PORT` o `3000`.
 - `npm run dev`: inicia la API con reinicio automático.
 - `npm run setup:admin`: crea el primer administrador usando las variables `BOOTSTRAP_ADMIN_*`.
+- `npm run db:migrate -- --check`: consulta cuántas migraciones faltan, sin modificar la base.
+- `npm run db:migrate`: aplica las migraciones pendientes de forma incremental, conservando los datos existentes.
 - `npm test`: ejecuta las pruebas del backend.
 
 Importá `mysql-schema.sql` en MySQL/phpMyAdmin antes de iniciar la API y configurá `DATABASE_URL`.
+
+Si la base ya existe, ejecutá `npm run db:migrate` desde esta carpeta antes de desplegar la API actualizada. La migración `0001_people.sql` agrega `people`, `person_documents`, `person_document_files` y la relación opcional `vehicles.person_id`, sin reconstruir las tablas actuales. Para una instalación nueva podés usar el esquema completo o ejecutar todas las migraciones con el mismo comando.
+
+Personas comparte el catálogo `document_types` con Vehículos. Sus documentos y adjuntos tienen tablas propias y conservan versiones anteriores al renovar. Cada vehículo admite una persona asignada y una persona puede estar asociada con varios vehículos. El campo de conductor anterior se conserva para los registros existentes.
 
 ## Render
 

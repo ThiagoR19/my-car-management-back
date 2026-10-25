@@ -61,9 +61,13 @@ export function formatDate(value) {
 
 export function enrichDocument(document, store, now = new Date()) {
   const vehicle = store.vehicles.find((item) => item.id === document.vehicleId)
+  const person = store.people?.find((item) => item.id === document.personId)
+  const assignedPerson = store.people?.find((item) => item.id === vehicle?.personId)
+  const personName = person ? `${person.firstName} ${person.lastName}` : ''
+  const ownerType = document.personId ? 'person' : 'vehicle'
   const type = store.documentTypes.find((item) => item.id === document.typeId)
   const computed = expirationStatus(document, type, now, store.settings)
-  return { ...document, typeName: type?.name ?? 'Otro', vehiclePlate: vehicle?.plate ?? '—', vehicleUnit: vehicle?.unit ?? '', owner: vehicle?.driver || 'Sin asignar', vehicleName: vehicle ? `${vehicle.brand} ${vehicle.model}` : '—', status: computed.label, statusTone: computed.tone, alertStage: computed.alertStage, daysRemaining: computed.daysRemaining, formattedExpirationDate: computed.daysRemaining === null ? '—' : formatDate(document.expirationDate) }
+  return { ...document, typeName: type?.name ?? 'Otro', ownerType, personName, personIdentification: person ? `${person.identificationType} ${person.identificationNumber}` : '', ownerLabel: personName || vehicle?.plate || '—', vehiclePlate: vehicle?.plate ?? '—', vehicleUnit: vehicle?.unit ?? '', owner: personName || (assignedPerson ? `${assignedPerson.firstName} ${assignedPerson.lastName}` : vehicle?.driver) || 'Sin asignar', vehicleName: vehicle ? `${vehicle.brand} ${vehicle.model}` : '—', status: computed.label, statusTone: computed.tone, alertStage: computed.alertStage, daysRemaining: computed.daysRemaining, formattedExpirationDate: computed.daysRemaining === null ? '—' : formatDate(document.expirationDate) }
 }
 
 export function getExpirations(store, query = {}, now = new Date()) {
@@ -71,12 +75,15 @@ export function getExpirations(store, query = {}, now = new Date()) {
   const rows = store.documents.filter((doc) => doc.active !== false && parseDate(doc.expirationDate)).map((doc) => enrichDocument(doc, store, now)).filter((doc) => {
     if (doc.daysRemaining === null) return false
     const vehicle = store.vehicles.find((item) => item.id === doc.vehicleId)
-    if (!vehicle || vehicle.status === 'Baja') return false
+    const person = store.people?.find((item) => item.id === doc.personId)
+    if (doc.personId ? !person || person.active === false : !vehicle || vehicle.status === 'Baja') return false
     if (query.vehicleId && doc.vehicleId !== query.vehicleId) return false
+    if (query.personId && doc.personId !== query.personId) return false
+    if (query.ownerType && doc.ownerType !== query.ownerType) return false
     if (query.status && doc.status !== query.status) return false
     if (query.documentTypeId && doc.typeId !== query.documentTypeId) return false
     const term = String(query.q ?? '').trim().toLowerCase()
-    if (term && !`${vehicle.plate} ${vehicle.unit} ${vehicle.brand} ${vehicle.model} ${doc.typeName}`.toLowerCase().includes(term)) return false
+    if (term && !`${vehicle?.plate || ''} ${vehicle?.unit || ''} ${vehicle?.brand || ''} ${vehicle?.model || ''} ${doc.personName} ${doc.personIdentification} ${doc.typeName}`.toLowerCase().includes(term)) return false
     if (query.scope === 'overdue' && doc.daysRemaining >= 0) return false
     if (query.scope === 'this-month' && !(parseDate(doc.expirationDate).getFullYear() === current.getFullYear() && parseDate(doc.expirationDate).getMonth() === current.getMonth())) return false
     if (query.scope === 'next-month') {
@@ -95,6 +102,10 @@ export function addAudit(store, actor, action, entity, entityId, data = {}) {
 
 function auditSubject(item, store) {
   const data = item.data || {}
+  if (item.entity === 'person') {
+    const person = store.people?.find((candidate) => candidate.id === item.entityId)
+    return `persona ${person ? `${person.firstName} ${person.lastName}` : data.name || item.entityId}`
+  }
   if (item.entity === 'vehicle' || item.entity === 'vehicles') {
     const vehicle = store.vehicles.find((candidate) => candidate.id === item.entityId)
     if (vehicle) return `vehículo #${vehicle.unit} · ${vehicle.plate} · ${vehicle.brand} ${vehicle.model}`
@@ -104,7 +115,7 @@ function auditSubject(item, store) {
     const document = store.documents.find((candidate) => candidate.id === item.entityId)
     if (document) {
       const enriched = enrichDocument(document, store)
-      return `${enriched.typeName} del vehículo ${enriched.vehiclePlate}`
+      return enriched.personId ? `${enriched.typeName} de ${enriched.personName}` : `${enriched.typeName} del vehículo ${enriched.vehiclePlate}`
     }
     return data.typeName || data.typeId || 'documento'
   }
@@ -160,7 +171,7 @@ export function describeAudit(item, store) {
     return `${item.employeeName || 'Sistema'} actualizó ${subject}${fields.length ? `: ${fields.join(', ')}` : ''}`
   }
   if (item.action === 'updated' && data.changedFields?.length) {
-    const fieldLabels = { unit: 'unidad', plate: 'patente', typeId: 'tipo', brand: 'marca', model: 'modelo', year: 'año', status: 'estado', number: 'número', issueDate: 'fecha de emisión', expirationDate: 'fecha de vencimiento', notes: 'observaciones' }
+    const fieldLabels = { unit: 'unidad', plate: 'patente', typeId: 'tipo', brand: 'marca', model: 'modelo', year: 'año', status: 'estado', number: 'número', issueDate: 'fecha de emisión', expirationDate: 'fecha de vencimiento', notes: 'observaciones', personId: 'persona asignada', firstName: 'nombre', lastName: 'apellido', identificationType: 'tipo de identificación', identificationNumber: 'número de identificación', birthDate: 'fecha de nacimiento', email: 'email', phone: 'teléfono', address: 'domicilio', city: 'localidad', province: 'provincia', nationality: 'nacionalidad', active: 'estado' }
     const fields = data.changedFields.map((field) => fieldLabels[field] || field).join(', ')
     return `${item.employeeName || 'Sistema'} actualizó ${subject}: ${fields}`
   }
@@ -202,7 +213,9 @@ export function dashboard(store, now = new Date()) {
     activeVehicles: activeVehicles.length,
     totalVehicles: store.vehicles.filter((vehicle) => vehicle.status !== 'Baja').length,
     overdueDocuments: expirations.filter((item) => item.status === 'Vencido').length,
-    overdueVehicleCount: new Set(expirations.filter((item) => item.status === 'Vencido').map((item) => item.vehicleId)).size,
+    overdueVehicleCount: new Set(expirations.filter((item) => item.status === 'Vencido' && item.vehicleId).map((item) => item.vehicleId)).size,
+    activePeople: (store.people || []).filter((person) => person.active !== false).length,
+    overduePersonCount: new Set(expirations.filter((item) => item.status === 'Vencido' && item.personId).map((item) => item.personId)).size,
     urgentDocuments: expirations.filter((item) => item.status === 'Muy próximo').length,
     thisMonth: getExpirations(store, { scope: 'this-month' }, now).length,
     nextMonth: getExpirations(store, { scope: 'next-month' }, now).length,

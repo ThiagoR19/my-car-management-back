@@ -71,6 +71,25 @@ export const vehicleTypes = mysqlTable('vehicle_types', {
   updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().notNull(),
 })
 
+export const people = mysqlTable('people', {
+  id: id().primaryKey(),
+  firstName: shortText('first_name').notNull(),
+  lastName: shortText('last_name').notNull(),
+  identificationType: shortText('identification_type').default('DNI').notNull(),
+  identificationNumber: shortText('identification_number').notNull(),
+  birthDate: date('birth_date', { mode: 'string' }),
+  email: shortText('email'),
+  phone: shortText('phone'),
+  address: shortText('address'),
+  city: shortText('city'),
+  province: shortText('province'),
+  nationality: shortText('nationality'),
+  notes: text('notes'),
+  active: boolean('active').default(true).notNull(),
+  createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().notNull(),
+}, (table) => [uniqueIndex('people_identification_unique').on(table.identificationType, table.identificationNumber)])
+
 export const vehicles = mysqlTable('vehicles', {
   id: id().primaryKey(),
   plate: shortText('plate').notNull().unique(),
@@ -86,6 +105,7 @@ export const vehicles = mysqlTable('vehicles', {
   mileage: int('mileage').default(0).notNull(),
   branch: shortText('branch'),
   driver: shortText('driver'),
+  personId: id('person_id').references(() => people.id, { onDelete: 'set null' }),
   notes: text('notes'),
   createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().notNull(),
@@ -126,6 +146,33 @@ export const vehicleDocuments = mysqlTable('vehicle_documents', {
 export const documentFiles = mysqlTable('document_files', {
   id: id().primaryKey(),
   documentId: id('document_id').notNull().references(() => vehicleDocuments.id),
+  fileName: shortText('file_name').notNull(),
+  mimeType: shortText('mime_type').notNull(),
+  storageKey: shortText('storage_key').notNull(),
+  sizeBytes: int('size_bytes').notNull(),
+  createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+})
+
+export const personDocuments = mysqlTable('person_documents', {
+  id: id().primaryKey(),
+  personId: id('person_id').notNull().references(() => people.id),
+  typeId: id('type_id').notNull().references(() => documentTypes.id),
+  number: shortText('number'),
+  issueDate: timestamp('issue_date', { mode: 'date' }),
+  expirationDate: timestamp('expiration_date', { mode: 'date' }),
+  observations: text('observations'),
+  active: boolean('active').default(true).notNull(),
+  version: int('version').default(1).notNull(),
+  previousId: id('previous_id'),
+  rootId: id('root_id').notNull(),
+  activeRootKey: id('active_root_key').generatedAlwaysAs(sql`IF(active = 1, root_id, NULL)`, { mode: 'stored' }),
+  createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().notNull(),
+}, (table) => [uniqueIndex('person_documents_active_root_unique').on(table.activeRootKey)])
+
+export const personDocumentFiles = mysqlTable('person_document_files', {
+  id: id().primaryKey(),
+  documentId: id('document_id').notNull().references(() => personDocuments.id),
   fileName: shortText('file_name').notNull(),
   mimeType: shortText('mime_type').notNull(),
   storageKey: shortText('storage_key').notNull(),
@@ -199,6 +246,7 @@ export const vehicleTypesRelations = relations(vehicleTypes, ({ many }) => ({
 
 export const vehiclesRelations = relations(vehicles, ({ one, many }) => ({
   type: one(vehicleTypes, { fields: [vehicles.typeId], references: [vehicleTypes.id] }),
+  person: one(people, { fields: [vehicles.personId], references: [people.id] }),
   documents: many(vehicleDocuments),
   repairs: many(repairs),
 }))
@@ -209,6 +257,22 @@ export const repairsRelations = relations(repairs, ({ one }) => ({
 
 export const documentTypesRelations = relations(documentTypes, ({ many }) => ({
   documents: many(vehicleDocuments),
+  personDocuments: many(personDocuments),
+}))
+
+export const peopleRelations = relations(people, ({ many }) => ({
+  vehicles: many(vehicles),
+  documents: many(personDocuments),
+}))
+
+export const personDocumentsRelations = relations(personDocuments, ({ one, many }) => ({
+  person: one(people, { fields: [personDocuments.personId], references: [people.id] }),
+  type: one(documentTypes, { fields: [personDocuments.typeId], references: [documentTypes.id] }),
+  files: many(personDocumentFiles),
+}))
+
+export const personDocumentFilesRelations = relations(personDocumentFiles, ({ one }) => ({
+  document: one(personDocuments, { fields: [personDocumentFiles.documentId], references: [personDocuments.id] }),
 }))
 
 export const vehicleDocumentsRelations = relations(vehicleDocuments, ({ one, many }) => ({

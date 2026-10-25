@@ -8,6 +8,13 @@
       "when": 1792800337921,
       "tag": "0000_initial_mysql",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1792886737921,
+      "tag": "0001_people",
+      "breakpoints": true
     }
   ]
 }

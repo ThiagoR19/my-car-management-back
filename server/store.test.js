@@ -9,25 +9,27 @@ import { readStore, writeStore } from './store.js'
 // adapter only binds tagged-template parameters and maps driver value types; it
 // does not simulate persistence behavior. The MySQL migration remains the
 // source of the relational table layout.
-function isolatedDatabase(snapshotName = '0000_snapshot.json', { rawBooleans = false } = {}) {
+function isolatedDatabase(snapshotName = '0001_snapshot.json', { rawBooleans = false, mysqlDateOffset } = {}) {
   const database = new DatabaseSync(':memory:')
   database.exec('PRAGMA foreign_keys = ON')
   const snapshot = JSON.parse(readFileSync(new URL(`../drizzle/migrations/meta/${snapshotName}`, import.meta.url), 'utf8'))
   const quote = (name) => `"${name.replaceAll('"', '""')}"`
   for (const table of Object.values(snapshot.tables)) {
     const definitions = Object.values(table.columns).map((column) => {
-      const type = ['integer', 'boolean'].includes(column.type) ? 'INTEGER' : 'TEXT'
+      const type = ['int', 'integer', 'boolean'].includes(column.type) ? 'INTEGER' : 'TEXT'
       const fallback = /^\(?now\(\)\)?$/.test(String(column.default)) ? '(CURRENT_TIMESTAMP)' : typeof column.default === 'boolean' ? Number(column.default) : typeof column.default === 'string' ? column.default : column.default
+      if (column.generated) return `${quote(column.name)} ${type} GENERATED ALWAYS AS (CASE WHEN active = 1 THEN root_id ELSE NULL END) STORED`
       return `${quote(column.name)} ${type}${column.primaryKey ? ' PRIMARY KEY' : ''}${column.notNull ? ' NOT NULL' : ''}${fallback !== undefined ? ` DEFAULT ${fallback}` : ''}`
     })
     for (const primary of Object.values(table.compositePrimaryKeys || {})) definitions.push(`PRIMARY KEY (${primary.columns.map(quote).join(', ')})`)
     for (const unique of Object.values(table.uniqueConstraints)) definitions.push(`UNIQUE (${unique.columns.map(quote).join(', ')})`)
+    for (const index of Object.values(table.indexes || {})) if (index.isUnique) definitions.push(`UNIQUE (${index.columns.map(quote).join(', ')})`)
     for (const reference of Object.values(table.foreignKeys)) definitions.push(`FOREIGN KEY (${reference.columnsFrom.map(quote).join(', ')}) REFERENCES ${quote(reference.tableTo)} (${reference.columnsTo.map(quote).join(', ')}) ON DELETE ${reference.onDelete}`)
     database.exec(`CREATE TABLE ${quote(table.name)} (${definitions.join(', ')})`)
   }
   const encode = (value) => value instanceof Date ? value.toISOString() : typeof value === 'boolean' ? Number(value) : value && typeof value === 'object' ? JSON.stringify(value) : value
-  const decode = (row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
-    value === null ? null : !rawBooleans && ['active', 'read', 'requiresExpiration'].includes(key) ? Boolean(value) : ['data', 'requiredDocumentTypeIds', 'emailAlerts', 'parts'].includes(key) ? JSON.parse(value) : /At$/.test(key) || ['issueDate', 'expirationDate'].includes(key) ? new Date(value) : value,
+  const decode = (row, columns) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
+    value === null ? null : mysqlDateOffset && columns.some(column => column.name === key && column.table === 'people' && column.column === 'birth_date') ? new Date(`${value}T00:00:00${mysqlDateOffset}`) : !rawBooleans && ['active', 'read', 'requiresExpiration'].includes(key) ? Boolean(value) : ['data', 'requiredDocumentTypeIds', 'emailAlerts', 'parts'].includes(key) ? JSON.parse(value) : /At$/.test(key) || ['issueDate', 'expirationDate'].includes(key) ? new Date(value) : value,
   ]))
   const client = (strings, ...values) => {
     if (typeof strings === 'string') return { identifier: strings }
@@ -48,7 +50,7 @@ function isolatedDatabase(snapshotName = '0000_snapshot.json', { rawBooleans = f
       statement += strings[index + 1]
     }
     const prepared = database.prepare(statement)
-    return Promise.resolve(prepared.columns().length ? prepared.all(...bindings).map(decode) : (prepared.run(...bindings), []))
+    return Promise.resolve(prepared.columns().length ? prepared.all(...bindings).map(row => decode(row, prepared.columns())) : (prepared.run(...bindings), []))
   }
   client.json = value => value
   client.begin = async (callback) => {
@@ -173,4 +175,110 @@ test('mysqlConfig activa TLS solo cuando la URL o la CA lo piden', async () => {
   const withCa = mysqlConfig('mysql://user:pass@host/base', '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----')
   assert.equal(withCa.ssl.ca, '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----')
   assert.equal(withCa.ssl.rejectUnauthorized, true)
+})
+
+test('persiste personas, asignaciones y archivos sin mezclar documentos de vehículos', async (t) => {
+  const { database, client } = isolatedDatabase(undefined, { rawBooleans: true })
+  t.after(() => database.close())
+  const initial = fixture()
+  initial.people = [{ id: 'p', firstName: 'Ana', lastName: 'Pérez', identificationType: 'DNI', identificationNumber: '30111222', birthDate: '1990-06-15', email: 'ana@example.com', phone: '1122334455', address: 'San Martín 100', city: 'Rosario', province: 'Santa Fe', nationality: 'Argentina', notes: 'Conductora', active: true }]
+  initial.vehicles[0].personId = 'p'
+  initial.documents.push({ id: 'pd', personId: 'p', typeId: 'dt', number: 'LIC-1', issueDate: '2026-01-01', expirationDate: '2027-01-01', notes: 'Licencia', active: true, version: 1, fileId: 'pf', fileName: 'licencia.pdf', filePath: 'licencia-storage.pdf', mimeType: 'application/pdf', sizeBytes: 100 })
+  await writeStore(initial, client)
+  let loaded = await readStore(client)
+  assert.equal(loaded.people[0].firstName, 'Ana')
+  assert.equal(loaded.people[0].birthDate, '1990-06-15')
+  assert.equal(loaded.people[0].active, true)
+  assert.equal(loaded.vehicles[0].personId, 'p')
+  const personalDocument = loaded.documents.find(doc => doc.id === 'pd')
+  assert.equal(personalDocument.personId, 'p')
+  assert.equal(personalDocument.vehicleId, undefined)
+  assert.equal(personalDocument.fileName, 'licencia.pdf')
+  assert.equal(personalDocument.sizeBytes, 100)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM vehicle_documents').get().count, 1)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_documents').get().count, 1)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM document_files').get().count, 0)
+  loaded.vehicles[0].personId = null
+  loaded.people[0].active = false
+  loaded.people[0].notes = ''
+  await writeStore(loaded, client)
+  loaded = await readStore(client)
+  assert.equal(loaded.vehicles[0].personId, null)
+  assert.equal(loaded.people[0].active, false)
+  assert.equal(loaded.people[0].notes, '')
+})
+
+test('la fecha de nacimiento conserva el día al leer y editar en distintas zonas del servidor', async () => {
+  for (const mysqlDateOffset of ['+09:00', '-03:00']) {
+    const { database, client } = isolatedDatabase(undefined, { mysqlDateOffset })
+    try {
+      const initial = fixture()
+      initial.people = [{ id: 'p', firstName: 'Ana', lastName: 'Pérez', identificationType: 'DNI', identificationNumber: '30111222', birthDate: '1990-06-15', active: true }]
+      await writeStore(initial, client)
+      const [nativeDate] = await client`SELECT birth_date AS birthDate FROM people`
+      assert.ok(nativeDate.birthDate instanceof Date)
+      if (mysqlDateOffset === '+09:00') assert.equal(nativeDate.birthDate.toISOString().slice(0, 10), '1990-06-14')
+      const loaded = await readStore(client)
+      assert.equal(loaded.people[0].birthDate, '1990-06-15')
+      loaded.people[0].phone = '123456'
+      await writeStore(loaded, client)
+      assert.equal((await readStore(client)).people[0].birthDate, '1990-06-15')
+    } finally { database.close() }
+  }
+})
+
+test('la renovación personal conserva el archivo histórico y limita la cadena a una versión activa', async (t) => {
+  const { database, client } = isolatedDatabase()
+  t.after(() => database.close())
+  const initial = fixture()
+  initial.people = [{ id: 'p', firstName: 'Ana', lastName: 'Pérez', identificationType: 'DNI', identificationNumber: '30111222', active: true }]
+  initial.documents.push({ id: 'pd', personId: 'p', typeId: 'dt', expirationDate: '2026-01-01', active: true, version: 1, fileName: 'anterior.pdf', filePath: 'anterior.pdf' })
+  await writeStore(initial, client)
+  let loaded = await readStore(client)
+  const previous = loaded.documents.find(doc => doc.id === 'pd')
+  previous.active = false
+  loaded.documents.push({ id: 'pd2', rootId: 'pd', previousId: 'pd', personId: 'p', typeId: 'dt', expirationDate: '2027-01-01', active: true, version: 2 })
+  await writeStore(loaded, client)
+  loaded = await readStore(client)
+  assert.equal(loaded.documents.find(doc => doc.id === 'pd').fileName, 'anterior.pdf')
+  assert.equal(loaded.documents.find(doc => doc.id === 'pd2').fileName, undefined)
+  assert.equal(loaded.documents.find(doc => doc.id === 'pd2').version, 2)
+  loaded.documents.push({ id: 'pd3', rootId: 'pd', personId: 'p', typeId: 'dt', active: true })
+  await assert.rejects(writeStore(loaded, client), /UNIQUE/)
+  assert.equal((await readStore(client)).documents.filter(doc => doc.personId === 'p').length, 2)
+})
+
+test('rechaza identificaciones duplicadas y asignaciones inexistentes con reversión completa', async (t) => {
+  const { database, client } = isolatedDatabase()
+  t.after(() => database.close())
+  const initial = fixture()
+  initial.people = [{ id: 'p', firstName: 'Ana', lastName: 'Pérez', identificationType: 'DNI', identificationNumber: '30111222', active: true }]
+  await writeStore(initial, client)
+  let loaded = await readStore(client)
+  loaded.people.push({ ...loaded.people[0], id: 'p2' })
+  await assert.rejects(writeStore(loaded, client), /UNIQUE/)
+  loaded = await readStore(client)
+  loaded.vehicles[0].personId = 'missing'
+  loaded.people[0].firstName = 'No guardar'
+  await assert.rejects(writeStore(loaded, client), /FOREIGN KEY/)
+  assert.equal((await readStore(client)).people[0].firstName, 'Ana')
+})
+
+test('reemplazar o quitar un adjunto personal actualiza solo su registro de archivo', async (t) => {
+  const { database, client } = isolatedDatabase()
+  t.after(() => database.close())
+  const initial = fixture()
+  initial.people = [{ id: 'p', firstName: 'Ana', lastName: 'Pérez', identificationType: 'DNI', identificationNumber: '30111222', active: true }]
+  initial.documents.push({ id: 'pd', personId: 'p', typeId: 'dt', active: true, fileName: 'anterior.pdf', filePath: 'anterior.pdf' })
+  await writeStore(initial, client)
+  let loaded = await readStore(client)
+  Object.assign(loaded.documents.find(doc => doc.id === 'pd'), { fileName: 'actual.pdf', filePath: 'actual.pdf', sizeBytes: 200 })
+  await writeStore(loaded, client)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_document_files').get().count, 1)
+  loaded = await readStore(client)
+  assert.equal(loaded.documents.find(doc => doc.id === 'pd').fileName, 'actual.pdf')
+  for (const field of ['fileId', 'fileName', 'filePath', 'mimeType', 'sizeBytes']) delete loaded.documents.find(doc => doc.id === 'pd')[field]
+  await writeStore(loaded, client)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_document_files').get().count, 0)
+  assert.equal((await readStore(client)).documents.length, 2)
 })

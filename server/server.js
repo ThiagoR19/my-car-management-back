@@ -6,7 +6,7 @@ import { scryptSync, timingSafeEqual, randomUUID, createHash } from 'node:crypto
 import cors from 'cors'
 import { addAudit, dashboard, describeAudit, enrichDocument, getExpirations, isVehicleDocumentationIncomplete, todayIso } from './domain.js'
 import { passwordRecord, readStore, uploadsDir, writeStore, withStoreTransaction } from './store.js'
-import { csvEscape, parseCsv, validateDocument, validateSettings, validateVehicle, validateDocumentType, validateBooleans, integer, invalid, ValidationError } from './validation.js'
+import { csvEscape, parseCsv, validateDocument, validateSettings, validateVehicle, validatePerson, validateDocumentType, validateBooleans, integer, invalid, ValidationError } from './validation.js'
 import { recordRepair, vehicleHistory } from './maintenance.js'
 import { buildEmailReport, createMailer, deliverEmail, emailConfig, logSmtpError, runScheduledEmail, sendTestEmail, smtpErrorMessage, validateEmailConfig } from './email.js'
 
@@ -132,9 +132,18 @@ function validateRole(body) {
 }
 
 function vehicleView(vehicle, store) {
+  const person = store.people?.find((item) => item.id === vehicle.personId)
+  const personName = person ? `${person.firstName} ${person.lastName}` : ''
   const documents = store.documents.filter((doc) => doc.vehicleId === vehicle.id && doc.active !== false).map((doc) => enrichDocument(doc, store))
   const next = documents.filter((doc) => doc.daysRemaining !== null).sort((a, b) => a.daysRemaining - b.daysRemaining)[0]
-  return { ...vehicle, type: typeName(store, vehicle.typeId), documents, documentCount: documents.length, documentationIncomplete: vehicle.status === 'Activo' && isVehicleDocumentationIncomplete(vehicle, store), nextExpiration: next || null }
+  return { ...vehicle, personId: vehicle.personId || null, personName, driver: personName || vehicle.driver || '', type: typeName(store, vehicle.typeId), documents, documentCount: documents.length, documentationIncomplete: vehicle.status === 'Activo' && isVehicleDocumentationIncomplete(vehicle, store), nextExpiration: next || null }
+}
+
+function personView(person, store) {
+  const documents = store.documents.filter((doc) => doc.personId === person.id && doc.active !== false).map((doc) => enrichDocument(doc, store))
+  const next = documents.filter((doc) => doc.daysRemaining !== null).sort((a, b) => a.daysRemaining - b.daysRemaining)[0]
+  const vehicles = store.vehicles.filter((vehicle) => vehicle.personId === person.id && vehicle.status !== 'Baja').map((vehicle) => ({ id: vehicle.id, unit: vehicle.unit, plate: vehicle.plate, brand: vehicle.brand, model: vehicle.model, status: vehicle.status }))
+  return { ...person, name: `${person.firstName} ${person.lastName}`, documents, documentCount: documents.length, nextExpiration: next || null, vehicles, vehicleCount: vehicles.length }
 }
 
 function upsertNotifications(store) {
@@ -143,7 +152,7 @@ function upsertNotifications(store) {
   const generated = expirations.filter((item) => item.statusTone === 'danger').map((item) => {
     const id = `notification-${item.id}`
     const existing = previous.get(id)
-    return { id, type: item.status === 'Vencido' ? 'danger' : 'warning', title: `${item.typeName} ${item.status === 'Vencido' ? 'vencido' : 'próximo a vencer'}`, description: `${item.vehiclePlate} · ${item.formattedExpirationDate}`, documentId: item.id, read: existing?.read === true, createdAt: existing?.createdAt || new Date().toISOString() }
+    return { id, type: item.status === 'Vencido' ? 'danger' : 'warning', title: `${item.typeName} ${item.status === 'Vencido' ? 'vencido' : 'próximo a vencer'}`, description: `${item.ownerLabel} · ${item.formattedExpirationDate}`, documentId: item.id, read: existing?.read === true, createdAt: existing?.createdAt || new Date().toISOString() }
   })
   const manual = store.notifications.filter((item) => !item.id.startsWith('notification-'))
   store.notifications = [...generated, ...manual]
@@ -253,6 +262,63 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   }
   if (req.method === 'GET' && parts[1] === 'dashboard') return send(res, 200, { ...dashboard(store), companyName: store.settings.companyName })
 
+  if (parts[1] === 'people') {
+    store.people ||= []
+    if (!parts[2]) {
+      if (req.method === 'GET') {
+        const q = (url.searchParams.get('q') || '').trim().toLowerCase()
+        const active = url.searchParams.get('active')
+        const items = store.people.filter((person) => (!q || `${person.firstName} ${person.lastName} ${person.identificationType} ${person.identificationNumber} ${person.email} ${person.phone}`.toLowerCase().includes(q)) && (!['true', 'false'].includes(active) || (person.active !== false) === (active === 'true'))).map((person) => personView(person, store))
+        return send(res, 200, { items, total: items.length })
+      }
+      if (req.method === 'POST') {
+        const person = validatePerson(body)
+        if (store.people.some((item) => item.identificationType.toUpperCase() === person.identificationType && item.identificationNumber.toUpperCase() === person.identificationNumber)) return error(res, 409, 'Ya existe una persona con esa identificación')
+        const created = { id: `person-${randomUUID()}`, ...person, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+        store.people.push(created)
+        addAudit(store, actor, 'created', 'person', created.id, { name: `${created.firstName} ${created.lastName}` })
+        await writeStore(store)
+        return send(res, 201, personView(created, store))
+      }
+    } else {
+      const person = store.people.find((item) => item.id === parts[2])
+      if (!person) return error(res, 404, 'Persona no encontrada')
+      if (parts[3] === 'documents' && !parts[4]) {
+        if (req.method === 'GET') return send(res, 200, { items: store.documents.filter((doc) => doc.personId === person.id).map((doc) => enrichDocument(doc, store)) })
+        if (req.method === 'POST') {
+          if (person.active === false) return error(res, 400, 'La persona está inactiva')
+          const document = validateDocument({ ...body, personId: person.id, active: true }, store)
+          if (store.documentTypes.find((type) => type.id === document.typeId)?.active === false) return error(res, 400, 'El tipo de documento está inactivo')
+          const id = `pdoc-${randomUUID()}`
+          const created = { id, rootId: id, ...document, version: 1, createdAt: new Date().toISOString() }
+          store.documents.push(created)
+          addAudit(store, actor, 'created', 'document', id, { personId: person.id, typeId: created.typeId, number: created.number, expirationDate: created.expirationDate })
+          await writeStore(store)
+          return send(res, 201, enrichDocument(created, store))
+        }
+      }
+      if (!parts[3]) {
+        if (req.method === 'GET') return send(res, 200, personView(person, store))
+        if (req.method === 'PUT') {
+          const changes = validatePerson({ ...person, ...body })
+          if (store.people.some((item) => item.id !== person.id && item.identificationType.toUpperCase() === changes.identificationType && item.identificationNumber.toUpperCase() === changes.identificationNumber)) return error(res, 409, 'Ya existe una persona con esa identificación')
+          const changedFields = Object.keys(changes).filter((field) => changes[field] !== person[field])
+          Object.assign(person, changes, { updatedAt: new Date().toISOString() })
+          addAudit(store, actor, 'updated', 'person', person.id, { name: `${person.firstName} ${person.lastName}`, changedFields })
+          await writeStore(store)
+          return send(res, 200, personView(person, store))
+        }
+        if (req.method === 'DELETE') {
+          person.active = false
+          person.updatedAt = new Date().toISOString()
+          addAudit(store, actor, 'deactivated', 'person', person.id, { name: `${person.firstName} ${person.lastName}` })
+          await writeStore(store)
+          return send(res, 200, personView(person, store))
+        }
+      }
+    }
+  }
+
   if (parts[1] === 'email-alerts') {
     if (!requireAdmin(res, actor)) return
     const config = emailConfig(store.settings)
@@ -321,7 +387,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     if (store.vehicles.some((item) => item.plate === vehicle.plate)) return error(res, 409, 'La patente ya existe')
     const created = { id: `vh-${randomUUID()}`, ...vehicle, type: typeName(store, vehicle.typeId), createdAt: new Date().toISOString() }
     store.vehicles.push(created)
-    addAudit(store, actor, 'created', 'vehicle', created.id, { plate: created.plate, unit: created.unit, typeId: created.typeId, brand: created.brand, model: created.model })
+    addAudit(store, actor, 'created', 'vehicle', created.id, { plate: created.plate, unit: created.unit, typeId: created.typeId, brand: created.brand, model: created.model, personId: created.personId })
     await writeStore(store)
     return send(res, 201, vehicleView(created, store))
   }
@@ -345,10 +411,10 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     if (index < 0) return error(res, 404, 'Vehículo no encontrado')
     if (req.method === 'GET') return send(res, 200, vehicleView(store.vehicles[index], store))
     if (req.method === 'PUT') {
-      const vehicle = validateVehicle({ ...store.vehicles[index], ...body }, store)
+      const vehicle = validateVehicle({ ...store.vehicles[index], ...body }, store, store.vehicles[index])
       if (store.vehicles.some((item, itemIndex) => itemIndex !== index && item.plate === vehicle.plate)) return error(res, 409, 'La patente ya existe')
       const previous = store.vehicles[index]
-      const changedFields = ['unit', 'plate', 'typeId', 'brand', 'model', 'year', 'status'].filter((field) => previous[field] !== vehicle[field])
+      const changedFields = ['unit', 'plate', 'typeId', 'brand', 'model', 'year', 'status', 'personId'].filter((field) => (previous[field] ?? null) !== (vehicle[field] ?? null))
       const previousValues = Object.fromEntries(changedFields.map((field) => [field, previous[field]]))
       const currentValues = Object.fromEntries(changedFields.map((field) => [field, vehicle[field]]))
       store.vehicles[index] = { ...store.vehicles[index], ...vehicle, type: typeName(store, vehicle.typeId), updatedAt: new Date().toISOString() }
@@ -368,7 +434,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
 
   if (req.method === 'GET' && parts[1] === 'expirations') {
     const scope = parts[2] || ''
-    return send(res, 200, { items: getExpirations(store, { q: url.searchParams.get('q'), status: url.searchParams.get('status'), documentTypeId: url.searchParams.get('documentTypeId'), scope, days: url.searchParams.get('days') }) })
+    return send(res, 200, { items: getExpirations(store, { q: url.searchParams.get('q'), status: url.searchParams.get('status'), documentTypeId: url.searchParams.get('documentTypeId'), personId: url.searchParams.get('personId'), vehicleId: url.searchParams.get('vehicleId'), ownerType: url.searchParams.get('ownerType'), scope, days: url.searchParams.get('days') }) })
   }
   if (req.method === 'GET' && parts[1] === 'calendar') return send(res, 200, { items: getExpirations(store, { q: url.searchParams.get('q') }) })
 
@@ -378,7 +444,8 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     if (previous.active === false || store.documents.some((item) => item.previousId === previous.id)) return error(res, 409, 'Este documento ya fue renovado o dado de baja. Actualizá la lista antes de continuar')
     if (body.typeId !== undefined && body.typeId !== previous.typeId) return error(res, 400, 'No se puede cambiar el tipo al renovar')
     if (body.vehicleId !== undefined && body.vehicleId !== previous.vehicleId) return error(res, 400, 'No se puede cambiar el vehículo al renovar')
-    const document = validateDocument({ vehicleId: previous.vehicleId, typeId: body.typeId ?? previous.typeId, issueDate: body.issueDate ?? todayIso(new Date(), store.settings.timezone), expirationDate: body.expirationDate, number: body.number ?? previous.number, notes: body.notes ?? '', active: true }, store)
+    if (body.personId !== undefined && body.personId !== previous.personId) return error(res, 400, 'No se puede cambiar la persona al renovar')
+    const document = validateDocument({ ...(previous.personId ? { personId: previous.personId } : { vehicleId: previous.vehicleId }), typeId: body.typeId ?? previous.typeId, issueDate: body.issueDate ?? todayIso(new Date(), store.settings.timezone), expirationDate: body.expirationDate, number: body.number ?? previous.number, notes: body.notes ?? '', active: true }, store)
     if (store.documentTypes.find((type) => type.id === document.typeId)?.active === false) return error(res, 400, 'El tipo de documento está inactivo')
     previous.active = false
     const renewed = { ...document, id: `doc-${randomUUID()}`, rootId: previous.rootId || previous.id, version: (previous.version || 1) + 1, previousId: previous.id, createdAt: new Date().toISOString() }
@@ -409,8 +476,8 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     if (req.method === 'GET') return send(res, 200, enrichDocument(store.documents[index], store))
     if (req.method === 'PUT') {
       const previous = store.documents[index]
-      if ((body.vehicleId !== undefined && body.vehicleId !== previous.vehicleId) || (body.typeId !== undefined && body.typeId !== previous.typeId)) return error(res, 400, 'El vehículo y el tipo de una versión documental no pueden cambiarse')
-      const updated = validateDocument({ ...previous, ...body, vehicleId: previous.vehicleId, active: previous.active !== false }, store)
+      if ((body.vehicleId !== undefined && body.vehicleId !== previous.vehicleId) || (body.personId !== undefined && body.personId !== previous.personId) || (body.typeId !== undefined && body.typeId !== previous.typeId)) return error(res, 400, 'El titular y el tipo de una versión documental no pueden cambiarse')
+      const updated = validateDocument({ ...previous, ...body, active: previous.active !== false }, store)
       const changedFields = ['typeId', 'number', 'issueDate', 'expirationDate', 'notes'].filter((field) => previous[field] !== updated[field])
       const previousValues = Object.fromEntries(changedFields.map((field) => [field, previous[field]]))
       const currentValues = Object.fromEntries(changedFields.map((field) => [field, updated[field]]))
@@ -743,10 +810,10 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     return send(res, 201, { created: created.length, errors })
   }
   if (req.method === 'GET' && parts[1] === 'export' && parts[2] === 'vehicles.csv') {
-    return csvResponse(res, [['Patente', 'Unidad', 'Tipo', 'Marca', 'Modelo', 'Año', 'Estado', 'Chasis', 'Motor', 'Color', 'Kilometraje', 'Sucursal', 'Conductor', 'Observaciones'], ...store.vehicles.map((vehicle) => [vehicle.plate, vehicle.unit, typeName(store, vehicle.typeId), vehicle.brand, vehicle.model, vehicle.year, vehicle.status, vehicle.chassis, vehicle.engine, vehicle.color, vehicle.mileage, vehicle.branch, vehicle.driver, vehicle.notes])], 'vehiculos.csv')
+    return csvResponse(res, [['Patente', 'Unidad', 'Tipo', 'Marca', 'Modelo', 'Año', 'Estado', 'Chasis', 'Motor', 'Color', 'Kilometraje', 'Sucursal', 'Conductor', 'Observaciones'], ...store.vehicles.map((vehicle) => [vehicle.plate, vehicle.unit, typeName(store, vehicle.typeId), vehicle.brand, vehicle.model, vehicle.year, vehicle.status, vehicle.chassis, vehicle.engine, vehicle.color, vehicle.mileage, vehicle.branch, vehicleView(vehicle, store).driver, vehicle.notes])], 'vehiculos.csv')
   }
   if (req.method === 'GET' && parts[1] === 'export' && parts[2] === 'expirations.csv') {
-    return csvResponse(res, [['Patente', 'Vehículo', 'Documento', 'Vencimiento', 'Días restantes', 'Estado'], ...getExpirations(store, {}).map((item) => [item.vehiclePlate, item.vehicleName, item.typeName, item.formattedExpirationDate, item.daysRemaining, item.status])], 'vencimientos.csv')
+    return csvResponse(res, [['Patente / persona', 'Vehículo / identificación', 'Documento', 'Vencimiento', 'Días restantes', 'Estado'], ...getExpirations(store, {}).map((item) => [item.ownerLabel, item.personId ? item.personIdentification : item.vehicleName, item.typeName, item.formattedExpirationDate, item.daysRemaining, item.status])], 'vencimientos.csv')
   }
   return error(res, 404, 'Ruta no encontrada')
 }
