@@ -28,8 +28,8 @@ function isolatedDatabase(snapshotName = '0001_snapshot.json', { rawBooleans = f
     database.exec(`CREATE TABLE ${quote(table.name)} (${definitions.join(', ')})`)
   }
   const encode = (value) => value instanceof Date ? value.toISOString() : typeof value === 'boolean' ? Number(value) : value && typeof value === 'object' ? JSON.stringify(value) : value
-  const decode = (row, columns) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
-    value === null ? null : mysqlDateOffset && columns.some(column => column.name === key && column.table === 'people' && column.column === 'birth_date') ? new Date(`${value}T00:00:00${mysqlDateOffset}`) : !rawBooleans && ['active', 'read', 'requiresExpiration'].includes(key) ? Boolean(value) : ['data', 'requiredDocumentTypeIds', 'emailAlerts', 'parts'].includes(key) ? JSON.parse(value) : /At$/.test(key) || ['issueDate', 'expirationDate'].includes(key) ? new Date(value) : value,
+  const decode = (row, offsetBirthDate = false) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
+    value === null ? null : offsetBirthDate && key === 'birthDate' ? new Date(`${value}T00:00:00${mysqlDateOffset}`) : !rawBooleans && ['active', 'read', 'requiresExpiration'].includes(key) ? Boolean(value) : ['data', 'requiredDocumentTypeIds', 'emailAlerts', 'parts'].includes(key) ? JSON.parse(value) : /At$/.test(key) || ['issueDate', 'expirationDate'].includes(key) ? new Date(value) : value,
   ]))
   const client = (strings, ...values) => {
     if (typeof strings === 'string') return { identifier: strings }
@@ -50,7 +50,9 @@ function isolatedDatabase(snapshotName = '0001_snapshot.json', { rawBooleans = f
       statement += strings[index + 1]
     }
     const prepared = database.prepare(statement)
-    return Promise.resolve(prepared.columns().length ? prepared.all(...bindings).map(row => decode(row, prepared.columns())) : (prepared.run(...bindings), []))
+    const isRead = /^\s*(SELECT|WITH|PRAGMA|SHOW|DESCRIBE|EXPLAIN)\b/i.test(statement)
+    const offsetBirthDate = mysqlDateOffset && /^\s*SELECT\s+birth_date\s+AS\s+birthDate\b/i.test(statement)
+    return Promise.resolve(isRead ? prepared.all(...bindings).map(row => decode(row, offsetBirthDate)) : (prepared.run(...bindings), []))
   }
   client.json = value => value
   client.begin = async (callback) => {
