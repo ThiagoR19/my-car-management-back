@@ -175,6 +175,7 @@ test('mysqlConfig activa TLS solo cuando la URL o la CA lo piden', async () => {
   const withCa = mysqlConfig('mysql://user:pass@host/base', '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----')
   assert.equal(withCa.ssl.ca, '-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----')
   assert.equal(withCa.ssl.rejectUnauthorized, true)
+  assert.equal(mysqlConfig('mysql://user:pass@public-host/base', '', { forceTls: true }).ssl.rejectUnauthorized, true)
 })
 
 test('persiste personas, asignaciones y archivos sin mezclar documentos de vehículos', async (t) => {

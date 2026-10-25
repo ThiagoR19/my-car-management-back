@@ -29,21 +29,28 @@ Personas comparte el catálogo `document_types` con Vehículos. Sus documentos y
 
 Este repositorio ya contiene la API en su raíz. Si configurás **Root Directory** en Render, dejalo vacío; después usá estos valores:
 
-- Build Command: `npm install`
+- Build Command: `npm ci`
+- Pre-Deploy Command: `npm run db:migrate`
 - Start Command: `npm start`
 - Health Check Path: `/api/health`
+
+El Blueprint configura un disco persistente en `/var/data` y guarda los adjuntos en `/var/data/uploads`. El servicio queda en una sola instancia porque los discos persistentes no se comparten entre instancias. Para escalar, migrá los adjuntos a un bucket privado S3-compatible.
 
 Variables obligatorias:
 
 - `DATABASE_URL`: URL de conexión MySQL. La base tiene que aceptar conexiones desde internet: un hosting compartido que solo expone `localhost` no sirve. Para bases en la nube como Aiven, agregá `?ssl-mode=REQUIRED` al final de la URL.
 - `DATABASE_CA_CERT`: solo si el proveedor usa una CA propia (Aiven): pegá el contenido completo del `ca.pem`.
+- `DATABASE_SSL=required` en producción fuerza TLS aunque la URL no incluya `ssl-mode`.
+- `CORS_ORIGINS`: obligatorio en producción; configurá el origen exacto del frontend, sin `*`.
 - Variables `SMTP_*` de `.env.example` si vas a usar alertas por correo.
 
 Después del primer despliegue, importá el esquema en la base y ejecutá una vez `npm run setup:admin` con las variables `BOOTSTRAP_ADMIN_*`. Eliminá esas variables después de crear el administrador.
 
 ## CORS y errores de conexión
 
-CORS está habilitado globalmente para cualquier origen y ruta, incluidos archivos y respuestas de error. Se configura con la dependencia `cors` y la variable `CORS_ORIGINS`, que acepta una lista separada por comas; en producción configurá el origen exacto del frontend, por ejemplo `CORS_ORIGINS=https://tu-frontend.example.com`. Admite encabezados personalizados y los métodos `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` y `OPTIONS` en el preflight; cada endpoint conserva sus métodos y permisos de autenticación. Las solicitudes `OPTIONS` reciben `204` sin acceder a MySQL. El frontend usa tokens Bearer, sin cookies entre dominios.
+CORS se configura con la variable `CORS_ORIGINS`, que acepta una lista separada por comas. En producción la API rechaza iniciar si falta la variable o contiene `*`; usá el origen exacto del frontend, por ejemplo `CORS_ORIGINS=https://tu-frontend.example.com`. El frontend usa tokens Bearer, sin cookies entre dominios.
+
+Login, registro y adjuntos tienen límites de frecuencia por IP. El límite evita fuerza bruta y abuso básico; para despliegues con varias instancias debe complementarse con un rate limiter en el proxy o WAF.
 
 Después de subir estos cambios al repositorio del backend, desplegá esa versión en Render. Cambiar el frontend o reiniciar Vite no actualiza la API remota.
 

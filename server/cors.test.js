@@ -62,7 +62,7 @@ test('los errores de base de datos conservan CORS en login y logout', async (t) 
     const response = await request(path, { method: 'POST' })
     assert.equal(response.status, 500)
     assert.equal(response.headers.get('access-control-allow-origin'), '*')
-    assert.deepEqual(await response.json(), { error: 'Invalid URL' })
+    assert.deepEqual(await response.json(), { error: 'Error interno del servidor' })
   }
 })
 
@@ -95,6 +95,6 @@ test('las descargas autenticadas también incluyen CORS y exponen Content-Dispos
   assert.equal(response.status, 200)
   assert.equal(response.headers.get('access-control-allow-origin'), '*')
   assert.equal(response.headers.get('access-control-expose-headers'), 'Content-Disposition')
-  assert.equal(response.headers.get('content-disposition'), 'inline; filename="document.json"')
+   assert.equal(response.headers.get('content-disposition'), 'attachment; filename="document.json"')
   assert.equal(await response.text(), readFileSync(path, 'utf8'))
 })

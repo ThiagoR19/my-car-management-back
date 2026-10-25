@@ -154,6 +154,16 @@ test('adjunta y descarga archivos personales con autenticación y conserva adjun
   assert.equal((await api.request(`/files/${id}`)).body, '%PDF-test')
 })
 
+test('los adjuntos rechazan MIME no permitido y contenido que no coincide', async () => {
+  const api = fixture({ people: [{ id: 'p1', ...personData() }] })
+  const created = await api.request('/people/p1/documents', { method: 'POST', body: { typeId: 'identity' } })
+  const id = created.body.id
+  const invalidMime = await api.request(`/documents/${id}/file`, { method: 'POST', body: { fileName: 'pagina.html', mimeType: 'text/html', fileBase64: Buffer.from('<script>alert(1)</script>').toString('base64') } })
+  assert.equal(invalidMime.status, 400)
+  const invalidSignature = await api.request(`/documents/${id}/file`, { method: 'POST', body: { fileName: 'imagen.png', mimeType: 'image/png', fileBase64: Buffer.from('no es png').toString('base64') } })
+  assert.equal(invalidSignature.status, 400)
+})
+
 test('Tipos de documentos protege los tipos usados por personas y aplica su configuración compartida', async () => {
   const api = fixture({ employees: [{ id: 'employee', name: 'Administración', role: 'Administrador', active: true }], people: [{ id: 'p1', ...personData() }], documents: [{ id: 'personal', personId: 'p1', typeId: 'identity', expirationDate: null, active: true }] })
   assert.equal((await api.request('/document-types/identity', { method: 'DELETE' })).status, 409)

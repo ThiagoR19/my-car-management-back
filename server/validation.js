@@ -183,7 +183,10 @@ export function parseCsv(csv) {
 }
 
 export function csvEscape(value) {
-  const text = String(value ?? '')
+  const raw = String(value ?? '')
+  // Prevent spreadsheet formula execution when an exported field starts with
+  // a dangerous formula character, including after whitespace/control chars.
+  const text = /^[\s]*[=+\-@]/.test(raw) ? `'${raw}` : raw
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
 }
 

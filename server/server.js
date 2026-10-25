@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { scryptSync, timingSafeEqual, randomUUID, createHash } from 'node:crypto'
@@ -12,9 +12,13 @@ import { buildEmailReport, createMailer, deliverEmail, emailConfig, logSmtpError
 
 const port = Number(process.env.PORT || 3000)
 const tokenHash = (token) => createHash('sha256').update(token).digest('hex')
+const maxUploadBytes = 2_000_000
+const allowedUploadTypes = new Set(['application/pdf', 'image/avif', 'image/gif', 'image/jpeg', 'image/png', 'image/webp'])
 
 function parseCorsOrigins(value = process.env.CORS_ORIGINS) {
   const origins = String(value || '').split(',').map((origin) => origin.trim()).filter(Boolean)
+  const production = String(process.env.NODE_ENV || '').toLowerCase() === 'production'
+  if (production && (!origins.length || origins.includes('*'))) throw new Error('CORS_ORIGINS debe contener el origen exacto del frontend en producción')
   return !origins.length || origins.includes('*') ? '*' : origins
 }
 
@@ -52,12 +56,69 @@ function error(res, status, message) {
   send(res, status, { error: message })
 }
 
+function safeErrorMessage(caught, status) {
+  return status < 500 ? caught?.message || 'Solicitud inválida' : 'Error interno del servidor'
+}
+
+function requestAddress(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+  return forwarded || req.socket?.remoteAddress || 'unknown'
+}
+
+function rateLimitKey(req, parts) {
+  if (req.method !== 'POST' || parts[0] !== 'api') return null
+  if (parts[1] === 'auth' && parts[2] === 'login') return `login:${requestAddress(req)}`
+  if (parts[1] === 'auth' && parts[2] === 'register') return `register:${requestAddress(req)}`
+  if (parts[1] === 'documents' && parts[3] === 'file') return `upload:${requestAddress(req)}`
+  return null
+}
+
+function rateLimitRule(parts) {
+  if (parts[1] === 'auth' && parts[2] === 'login') return { windowMs: 15 * 60_000, max: 20 }
+  if (parts[1] === 'auth' && parts[2] === 'register') return { windowMs: 60 * 60_000, max: 10 }
+  if (parts[1] === 'documents' && parts[3] === 'file') return { windowMs: 60 * 60_000, max: 60 }
+  return null
+}
+
+function takeRateLimit(bucketMap, key, rule, now = Date.now()) {
+  let bucket = bucketMap.get(key)
+  if (!bucket || now - bucket.startedAt >= rule.windowMs) {
+    bucket = { startedAt: now, count: 0 }
+    bucketMap.set(key, bucket)
+  }
+  bucket.count += 1
+  if (bucketMap.size > 10_000) {
+    for (const [entryKey, entry] of bucketMap) if (now - entry.startedAt >= rule.windowMs) bucketMap.delete(entryKey)
+  }
+  return bucket.count <= rule.max ? null : Math.max(1, Math.ceil((bucket.startedAt + rule.windowMs - now) / 1000))
+}
+
+function decodeUpload(body) {
+  const mimeType = String(body.mimeType || '').toLowerCase().split(';', 1)[0].trim()
+  if (!allowedUploadTypes.has(mimeType)) invalid('El archivo debe ser PDF, PNG, JPEG, GIF, WEBP o AVIF')
+  const raw = String(body.fileBase64 || '').replace(/^data:([^;,]+);base64,/, '').replace(/\s/g, '')
+  if (!raw || !/^[A-Za-z0-9+/]*={0,2}$/.test(raw) || raw.length % 4 === 1) invalid('El archivo codificado no es válido')
+  const fileBuffer = Buffer.from(raw, 'base64')
+  if (!fileBuffer.length || fileBuffer.length > maxUploadBytes) invalid('El archivo no puede superar 2 MB')
+  const ascii = (start, length) => fileBuffer.subarray(start, start + length).toString('ascii')
+  const validSignature = {
+    'application/pdf': ascii(0, 5) === '%PDF-',
+    'image/png': fileBuffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])),
+    'image/jpeg': fileBuffer.subarray(0, 3).equals(Buffer.from([255, 216, 255])),
+    'image/gif': ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a',
+    'image/webp': ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP',
+    'image/avif': ascii(4, 4) === 'ftyp' && /avif|avis/.test(ascii(8, 4)),
+  }[mimeType]
+  if (!validSignature) invalid('El contenido del archivo no coincide con su tipo declarado')
+  return { mimeType, fileBuffer }
+}
+
 async function readBody(req) {
   const chunks = []
   let size = 0
   for await (const chunk of req) {
     size += chunk.length
-    if (size > 3_000_000) throw new Error('El cuerpo de la solicitud supera el límite de 3 MB')
+    if (size > 3_000_000) invalid('El cuerpo de la solicitud supera el límite de 3 MB', 413)
     chunks.push(chunk)
   }
   if (!chunks.length) return {}
@@ -457,17 +518,24 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   if (parts[1] === 'documents' && parts[2] && parts[3] === 'file' && req.method === 'POST') {
     const document = store.documents.find((item) => item.id === parts[2])
     if (!document) return error(res, 404, 'Documento no encontrado')
-    const filename = String(body.fileName || 'documento.bin').replace(/[^a-zA-Z0-9._-]/g, '_')
-    const filePath = join(uploadsDir, `${document.id}-${filename}`)
     if (!body.fileBase64) return error(res, 400, 'El archivo es obligatorio')
-    const fileBuffer = Buffer.from(String(body.fileBase64).replace(/^data:[^;]+;base64,/, ''), 'base64')
-    writeFileSync(filePath, fileBuffer)
-    document.fileName = filename
-    document.filePath = filePath
-    document.mimeType = String(body.mimeType || 'application/octet-stream')
-    document.sizeBytes = fileBuffer.length
+    const { mimeType, fileBuffer } = decodeUpload(body)
+    const filename = String(body.fileName || 'documento').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120) || 'documento'
+    const filePath = join(uploadsDir, `${document.id}-${randomUUID()}-${filename}`)
+    const previousFilePath = document.filePath
+    writeFileSync(filePath, fileBuffer, { flag: 'wx', mode: 0o600 })
+    Object.assign(document, { fileName: filename, filePath, mimeType, sizeBytes: fileBuffer.length })
     addAudit(store, actor, 'attached_file', 'document', document.id, { fileName: filename })
-    await writeStore(store)
+    let persisted = false
+    try {
+      await writeStore(store)
+      persisted = true
+    } finally {
+      if (!persisted && existsSync(filePath)) unlinkSync(filePath)
+    }
+    if (persisted && previousFilePath && previousFilePath !== filePath && existsSync(previousFilePath)) {
+      try { unlinkSync(previousFilePath) } catch (caught) { console.error(`No se pudo limpiar el adjunto anterior: ${caught.message}`) }
+    }
     return send(res, 200, enrichDocument(document, store))
   }
   if (parts[1] === 'documents' && parts[2] && !parts[3]) {
@@ -496,7 +564,8 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   if (req.method === 'GET' && parts[1] === 'files' && parts[2]) {
     const document = store.documents.find((item) => item.id === parts[2])
     if (!document?.filePath || !existsSync(document.filePath)) return error(res, 404, 'Archivo no encontrado')
-    res.writeHead(200, { 'Content-Type': document.mimeType || 'application/octet-stream', 'Content-Disposition': `inline; filename="${document.fileName}"` })
+    const downloadName = String(document.fileName || 'documento').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120) || 'documento'
+    res.writeHead(200, { 'Content-Type': document.mimeType || 'application/octet-stream', 'Content-Disposition': `attachment; filename="${downloadName}"`, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' })
     return res.end(readFileSync(document.filePath))
   }
 
@@ -823,11 +892,18 @@ export function createApiServer({ readStore: loadStore = readStore, writeStore: 
   const context = { readStore: loadStore, writeStore: saveStore, mailer, now, sessionTtlMs }
   const corsMiddleware = createCorsMiddleware(corsOrigins)
   let mutations = Promise.resolve()
+  const rateLimitBuckets = new Map()
   async function dispatch(req, res) {
     // El preflight CORS no depende de la base: si MySQL falla, el navegador debe ver el error real y no uno de CORS.
     if (req.method === 'OPTIONS') return send(res, 204, '')
     const hasBody = ['POST', 'PUT', 'DELETE'].includes(req.method)
     const parts = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname.split('/').filter(Boolean).map(decodeURIComponent)
+    const rateKey = rateLimitKey(req, parts)
+    const rateRule = rateKey && rateLimitRule(parts)
+    if (rateKey && rateRule) {
+      const retryAfter = takeRateLimit(rateLimitBuckets, rateKey, rateRule, now())
+      if (retryAfter) return send(res, 429, { error: 'Demasiados intentos. Volvé a probar más tarde.' }, { 'Retry-After': String(retryAfter) })
+    }
     // GET notifications también guarda el estado al generar avisos.
     const mutates = hasBody || (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'notifications')
     const body = hasBody ? await readBody(req) : {}
@@ -843,9 +919,15 @@ export function createApiServer({ readStore: loadStore = readStore, writeStore: 
       // de leer el cuerpo o de intentar abrir una conexión con MySQL.
       const nextCalled = applyCors(req, res, corsMiddleware)
       if (req.method === 'OPTIONS' || !nextCalled) return
-      dispatch(req, res).catch((caught) => error(res, caught.statusCode || (caught instanceof SyntaxError || caught.message?.includes('obligatorio') || caught.message?.includes('válido') ? 400 : 500), caught.message || 'Error interno'))
+      dispatch(req, res).catch((caught) => {
+        const status = caught.statusCode || (caught instanceof SyntaxError || caught.message?.includes('obligatorio') || caught.message?.includes('válido') ? 400 : 500)
+        if (status >= 500) console.error(`Solicitud fallida: ${caught?.message || 'error desconocido'}`)
+        error(res, status, safeErrorMessage(caught, status))
+      })
     } catch (caught) {
-      error(res, caught.statusCode || 500, caught.message || 'Error interno')
+      const status = caught.statusCode || 500
+      if (status >= 500) console.error(`Solicitud fallida: ${caught?.message || 'error desconocido'}`)
+      error(res, status, safeErrorMessage(caught, status))
     }
   })
   // El programador comparte la cola de escrituras de la API y nunca guarda una copia vieja.

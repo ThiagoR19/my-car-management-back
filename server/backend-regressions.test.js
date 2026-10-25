@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 import { createApiServer } from './server.js'
 import { passwordRecord } from './store.js'
+import { csvEscape } from './validation.js'
 
 const password = 'prueba-segura-123'
 const credentials = passwordRecord(password)
@@ -72,6 +73,13 @@ test('valida fechas reales, su orden y el requisito de vencimiento del tipo', as
   assert.equal(result.status, 201)
   assert.equal(result.body.expirationDate, null)
   assert.equal(result.body.status, 'Sin vencimiento')
+})
+
+test('limita intentos públicos por IP y neutraliza fórmulas de planillas', async () => {
+  const api = fixture()
+  const attempts = await Promise.all(Array.from({ length: 21 }, () => api.request('/auth/login', { method: 'POST', body: { identifier: 'admin', password: 'incorrecta' } })))
+  assert.equal(attempts.filter((response) => response.status === 429).length, 1)
+  assert.equal(csvEscape('=HYPERLINK("https://example.test")'), '"\'=HYPERLINK(""https://example.test"")"')
 })
 
 test('dos renovaciones simultáneas crean un solo sucesor y conservan el adjunto en el original', async () => {

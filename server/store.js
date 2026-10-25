@@ -3,11 +3,14 @@ import mysql from 'mysql2/promise'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID, scryptSync, randomBytes } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const serverDir = dirname(fileURLToPath(import.meta.url))
-export const uploadsDir = join(serverDir, 'uploads')
+// Production points this at persistent storage (Render uses /var/data/uploads).
+// MySQL stores relative keys so deploy paths never become part of the data model.
+export const uploadsDir = resolve(process.env.UPLOADS_DIR || join(serverDir, 'uploads'))
+const legacyUploadsDir = resolve(serverDir, 'uploads')
 const connectionString = process.env.DATABASE_URL
 let sqlClient
 const operation = new AsyncLocalStorage()
@@ -17,19 +20,21 @@ function isTaggedClient(client) {
   return typeof client === 'function'
 }
 
-// Las bases en la nube (Aiven, TiDB, etc.) exigen TLS: se activa con ?ssl-mode=REQUIRED en la URL
-// y, si el proveedor usa una CA propia, se valida con el PEM de DATABASE_CA_CERT.
-function sslConfig(url, caCert) {
+// Las bases en la nube (Aiven, TiDB, etc.) exigen TLS. En producción se fuerza aunque
+// la URL no tenga ssl-mode, evitando enviar credenciales por una conexión sin cifrar.
+function sslConfig(url, caCert, forceTls = false) {
   const mode = (url.searchParams.get('ssl-mode') || url.searchParams.get('sslmode') || '').toUpperCase()
-  if (!caCert && !['REQUIRED', 'REQUIRE', 'VERIFY_CA', 'VERIFY_IDENTITY', 'VERIFY-FULL'].includes(mode)) return undefined
+  if (!forceTls && !caCert && !['REQUIRED', 'REQUIRE', 'VERIFY_CA', 'VERIFY_IDENTITY', 'VERIFY-FULL'].includes(mode)) return undefined
   return { rejectUnauthorized: true, minVersion: 'TLSv1.2', ...(caCert ? { ca: caCert.replaceAll('\\n', '\n') } : {}) }
 }
 
-export function mysqlConfig(urlValue, caCert = process.env.DATABASE_CA_CERT) {
+export function mysqlConfig(urlValue, caCert = process.env.DATABASE_CA_CERT, options = {}) {
   if (!urlValue) throw new Error('DATABASE_URL es obligatorio para usar MyCarManagement')
   const url = new URL(urlValue)
   if (!['mysql:', 'mysql2:'].includes(url.protocol)) throw new Error('DATABASE_URL debe usar el formato mysql://usuario:contrasena@host:3306/base')
-  const ssl = sslConfig(url, caCert?.trim())
+  const sslRequested = ['1', 'true', 'required', 'require'].includes(String(process.env.DATABASE_SSL || '').toLowerCase())
+  const production = String(process.env.NODE_ENV || '').toLowerCase() === 'production'
+  const ssl = sslConfig(url, caCert?.trim(), sslRequested || production || options.forceTls === true)
   return {
     ...(ssl ? { ssl } : {}),
     host: url.hostname,
@@ -119,7 +124,7 @@ const parseJson = (value, fallback = null) => {
 
 function mapDatabaseStore(rows) {
   const { employees, accessRequests, vehicleTypes, documentTypes, vehicles, documents, documentFiles, people = [], personDocuments = [], personDocumentFiles = [], notifications, audits, settings, parts = [], repairs = [], sessions = [] } = rows
-  const filesByDocument = Object.fromEntries([...documentFiles, ...personDocumentFiles].map((file) => [file.documentId, { fileId: file.id, fileName: file.fileName, filePath: file.storageKey, mimeType: file.mimeType, sizeBytes: file.sizeBytes }]))
+  const filesByDocument = Object.fromEntries([...documentFiles, ...personDocumentFiles].map((file) => [file.documentId, { fileId: file.id, fileName: file.fileName, filePath: resolveStoredFilePath(file.storageKey), mimeType: file.mimeType, sizeBytes: file.sizeBytes }]))
   return {
     employees: employees.map((employee) => ({ ...employee, role: employee.role === 'ADMINISTRADOR' ? 'Administrador' : 'Empleado', active: booleanValue(employee.active) })),
     accessRequests,
@@ -144,6 +149,24 @@ export const passwordRecord = (password) => {
 
 export function ensureStore() {
   mkdirSync(uploadsDir, { recursive: true })
+}
+
+export function resolveStoredFilePath(storageKey) {
+  if (!storageKey) return ''
+  if (!isAbsolute(storageKey)) return resolve(uploadsDir, storageKey)
+  const legacyKey = relative(legacyUploadsDir, storageKey)
+  const isLegacyUpload = legacyKey === '' || (!legacyKey.startsWith('..') && !isAbsolute(legacyKey))
+  return isLegacyUpload ? resolve(uploadsDir, legacyKey) : storageKey
+}
+
+export function storageKeyFromPath(filePath) {
+  if (!filePath || !isAbsolute(filePath)) return filePath
+  for (const base of [uploadsDir, legacyUploadsDir]) {
+    const candidate = relative(base, filePath)
+    const insideUploads = candidate === '' || (!candidate.startsWith('..') && !isAbsolute(candidate))
+    if (insideUploads) return candidate
+  }
+  return filePath
 }
 
 export async function readStore(clientOverride) {
@@ -185,9 +208,9 @@ function tables(data) {
     ['people', data.people || [], p => ({ id: p.id, first_name: p.firstName, last_name: p.lastName, identification_type: p.identificationType || 'DNI', identification_number: p.identificationNumber, birth_date: p.birthDate || null, email: p.email || '', phone: p.phone || '', address: p.address || '', city: p.city || '', province: p.province || '', nationality: p.nationality || '', notes: p.notes || '', active: p.active !== false, created_at: timestampValue(p.createdAt), updated_at: timestampValue(p.updatedAt) })],
     ['vehicles', data.vehicles, v => ({ id: v.id, plate: v.plate, unit: v.unit, type_id: v.typeId, brand: v.brand, model: v.model, year: v.year ?? null, chassis: v.chassis || '', engine: v.engine || '', color: v.color || '', status: appStatusToDatabase[v.status], mileage: v.mileage ?? 0, branch: v.branch || '', driver: v.driver || '', person_id: v.personId || null, notes: v.notes || '', created_at: timestampValue(v.createdAt), updated_at: timestampValue(v.updatedAt) })],
     ['vehicle_documents', data.documents.filter(d => !d.personId), d => ({ id: d.id, vehicle_id: d.vehicleId, type_id: d.typeId, number: d.number || '', issue_date: d.issueDate ? timestampValue(d.issueDate) : null, expiration_date: d.expirationDate ? timestampValue(d.expirationDate) : null, observations: d.notes || '', active: d.active !== false, version: d.version || 1, previous_id: d.previousId || null, root_id: d.rootId || d.id, created_at: timestampValue(d.createdAt), updated_at: timestampValue(d.updatedAt) })],
-    ['document_files', data.documents.filter(d => !d.personId && d.fileName && d.filePath).map(d => ({ id: d.fileId || 'file-' + d.id, documentId: d.id, fileName: d.fileName, mimeType: d.mimeType, filePath: d.filePath, sizeBytes: d.sizeBytes, createdAt: d.createdAt })), f => ({ id: f.id, document_id: f.documentId, file_name: f.fileName, mime_type: f.mimeType || 'application/octet-stream', storage_key: f.filePath, size_bytes: f.sizeBytes || 0, created_at: timestampValue(f.createdAt) })],
+    ['document_files', data.documents.filter(d => !d.personId && d.fileName && d.filePath).map(d => ({ id: d.fileId || 'file-' + d.id, documentId: d.id, fileName: d.fileName, mimeType: d.mimeType, filePath: d.filePath, sizeBytes: d.sizeBytes, createdAt: d.createdAt })), f => ({ id: f.id, document_id: f.documentId, file_name: f.fileName, mime_type: f.mimeType || 'application/octet-stream', storage_key: storageKeyFromPath(f.filePath), size_bytes: f.sizeBytes || 0, created_at: timestampValue(f.createdAt) })],
     ['person_documents', data.documents.filter(d => d.personId), d => ({ id: d.id, person_id: d.personId, type_id: d.typeId, number: d.number || '', issue_date: d.issueDate ? timestampValue(d.issueDate) : null, expiration_date: d.expirationDate ? timestampValue(d.expirationDate) : null, observations: d.notes || '', active: d.active !== false, version: d.version || 1, previous_id: d.previousId || null, root_id: d.rootId || d.id, created_at: timestampValue(d.createdAt), updated_at: timestampValue(d.updatedAt) })],
-    ['person_document_files', data.documents.filter(d => d.personId && d.fileName && d.filePath).map(d => ({ id: d.fileId || 'file-' + d.id, documentId: d.id, fileName: d.fileName, mimeType: d.mimeType, filePath: d.filePath, sizeBytes: d.sizeBytes, createdAt: d.createdAt })), f => ({ id: f.id, document_id: f.documentId, file_name: f.fileName, mime_type: f.mimeType || 'application/octet-stream', storage_key: f.filePath, size_bytes: f.sizeBytes || 0, created_at: timestampValue(f.createdAt) })],
+    ['person_document_files', data.documents.filter(d => d.personId && d.fileName && d.filePath).map(d => ({ id: d.fileId || 'file-' + d.id, documentId: d.id, fileName: d.fileName, mimeType: d.mimeType, filePath: d.filePath, sizeBytes: d.sizeBytes, createdAt: d.createdAt })), f => ({ id: f.id, document_id: f.documentId, file_name: f.fileName, mime_type: f.mimeType || 'application/octet-stream', storage_key: storageKeyFromPath(f.filePath), size_bytes: f.sizeBytes || 0, created_at: timestampValue(f.createdAt) })],
     ['notifications', data.notifications || [], n => ({ id: n.id, title: n.title, description: n.description, type: n.type, read: n.read === true, document_id: n.documentId || null, created_at: timestampValue(n.createdAt) })],
     ['audits', (data.audit || []).map(a => ({ ...a, employeeId: data.employees.some(e => e.id === a.employeeId) ? a.employeeId : null })), a => ({ id: a.id, employee_id: a.employeeId, employee_name: a.employeeName || 'Sistema', employee_email: a.employeeEmail ?? null, action: a.action, entity: a.entity, entity_id: a.entityId, data: a.data || {}, created_at: timestampValue(a.createdAt) }), ['data']],
     ['app_settings', [{ id: 1, ...data.settings }], s => ({ id: 1, first_alert_days: s.firstAlertDays ?? 30, second_alert_days: s.secondAlertDays ?? 15, urgent_days: s.urgentDays ?? 7, company_name: s.companyName || 'MyCarManagement', timezone: s.timezone || 'America/Argentina/Buenos_Aires', email_alerts: s.emailAlerts || {} }), ['email_alerts']],
