@@ -117,7 +117,7 @@ test('el kilometraje de reparaciones anteriores no retrocede el odómetro y los 
   const token = await f.login()
   assert.equal((await f.request('/repairs', { token, method: 'POST', body: repair({ mileage: 100 }) })).status, 201)
   assert.equal(f.snapshot().vehicles[0].mileage, 184320)
-  await f.request('/vehicles/vh-1', { token, method: 'DELETE' })
+  await f.request('/vehicles/vh-1', { token, method: 'PUT', body: { status: 'Baja' } })
   assert.equal((await f.request('/repairs', { token, method: 'POST', body: repair() })).status, 400)
   assert.ok((await f.request('/vehicles/vh-1/history', { token })).body.items.some((item) => item.kind === 'repair'))
 })

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { addAudit } from './domain.js'
+import { deletePerson, deleteVehicle } from './deletion.js'
 import { readStore, writeStore } from './store.js'
 
 // Run the repository's actual SQL against an isolated relational database. This
@@ -284,4 +285,69 @@ test('reemplazar o quitar un adjunto personal actualiza solo su registro de arch
   await writeStore(loaded, client)
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_document_files').get().count, 0)
   assert.equal((await readStore(client)).documents.length, 2)
+})
+
+test('la eliminación de personas persiste sin referencias huérfanas y conserva los documentos del vehículo', async (t) => {
+  const { database, client } = isolatedDatabase()
+  t.after(() => database.close())
+  const initial = fixture()
+  initial.people = [{ id: 'p', firstName: 'Ana', lastName: 'Pérez', identificationType: 'DNI', identificationNumber: '30111222', active: true }]
+  initial.vehicles[0].personId = 'p'
+  initial.vehicles[0].driver = 'Ana Pérez'
+  initial.documents[0].fileName = 'vehiculo.pdf'
+  initial.documents[0].filePath = 'vehiculo.pdf'
+  initial.documents.push(
+    { id: 'pd-old', personId: 'p', typeId: 'dt', active: false, fileName: 'anterior.pdf', filePath: 'anterior.pdf' },
+    { id: 'pd', personId: 'p', typeId: 'dt', active: true, previousId: 'pd-old', rootId: 'pd-old', version: 2, fileName: 'actual.pdf', filePath: 'actual.pdf' },
+  )
+  initial.notifications = [{ id: 'n', title: 'Aviso', description: 'Licencia', type: 'warning', documentId: 'pd' }]
+  await writeStore(initial, client)
+  const loaded = await readStore(client)
+  deletePerson(loaded, loaded.employees[0], loaded.people[0])
+  await writeStore(loaded, client)
+  const persisted = await readStore(client)
+  assert.deepEqual(persisted.people, [])
+  assert.equal(persisted.vehicles[0].personId, null)
+  assert.equal(persisted.vehicles[0].driver, '')
+  assert.equal(persisted.documents.length, 1)
+  assert.equal(persisted.documents[0].id, 'd')
+  assert.equal(persisted.documents[0].fileName, 'vehiculo.pdf')
+  assert.deepEqual(persisted.notifications, [])
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_document_files').get().count, 0)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_documents').get().count, 0)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM document_files').get().count, 1)
+  assert.equal(persisted.audit[0].action, 'deleted')
+  assert.equal(persisted.audit[0].data.name, 'Ana Pérez')
+})
+
+test('la eliminación de vehículos persiste con sus archivos y reparaciones sin afectar personas ni stock', async (t) => {
+  const { database, client } = isolatedDatabase()
+  t.after(() => database.close())
+  const initial = fixture()
+  initial.people = [{ id: 'p', firstName: 'Ana', lastName: 'Pérez', identificationType: 'DNI', identificationNumber: '30111222', active: true }]
+  initial.vehicles[0].personId = 'p'
+  initial.documents[0].fileName = 'vehiculo.pdf'
+  initial.documents[0].filePath = 'vehiculo.pdf'
+  initial.documents.push({ id: 'pd', personId: 'p', typeId: 'dt', active: true, fileName: 'persona.pdf', filePath: 'persona.pdf' })
+  initial.parts = [{ id: 'part', name: 'Aceite', stock: 6, unit: 'unidad' }]
+  initial.repairs = [{ id: 'r', vehicleId: 'v', description: 'Service', date: '2026-01-01', parts: [{ partId: 'part', quantity: 4 }], employeeId: 'admin', employeeName: 'admin' }]
+  initial.notifications = [{ id: 'n', title: 'Aviso', description: 'Seguro', type: 'warning', documentId: 'd' }]
+  await writeStore(initial, client)
+  const loaded = await readStore(client)
+  deleteVehicle(loaded, loaded.employees[0], loaded.vehicles[0])
+  await writeStore(loaded, client)
+  const persisted = await readStore(client)
+  assert.deepEqual(persisted.vehicles, [])
+  assert.deepEqual(persisted.repairs, [])
+  assert.deepEqual(persisted.notifications, [])
+  assert.equal(persisted.people[0].id, 'p')
+  assert.equal(persisted.parts[0].stock, 6)
+  assert.equal(persisted.documents.length, 1)
+  assert.equal(persisted.documents[0].id, 'pd')
+  assert.equal(persisted.documents[0].fileName, 'persona.pdf')
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM vehicle_documents').get().count, 0)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM document_files').get().count, 0)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_document_files').get().count, 1)
+  assert.equal(persisted.audit[0].action, 'deleted')
+  assert.equal(persisted.audit[0].data.plate, 'AA000AA')
 })

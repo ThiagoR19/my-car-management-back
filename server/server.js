@@ -8,6 +8,7 @@ import { addAudit, dashboard, describeAudit, enrichDocument, getExpirations, isV
 import { passwordRecord, readStore, uploadsDir, writeStore, withStoreTransaction } from './store.js'
 import { csvEscape, parseCsv, validateDocument, validateSettings, validateVehicle, validatePerson, validateDocumentType, validateBooleans, integer, invalid, ValidationError } from './validation.js'
 import { recordRepair, vehicleHistory } from './maintenance.js'
+import { cleanupDeletedFiles, deletePerson, deleteVehicle } from './deletion.js'
 import { buildEmailReport, createMailer, deliverEmail, emailConfig, logSmtpError, runScheduledEmail, sendTestEmail, smtpErrorMessage, validateEmailConfig } from './email.js'
 
 const port = Number(process.env.PORT || 3000)
@@ -370,11 +371,10 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
           return send(res, 200, personView(person, store))
         }
         if (req.method === 'DELETE') {
-          person.active = false
-          person.updatedAt = new Date().toISOString()
-          addAudit(store, actor, 'deactivated', 'person', person.id, { name: `${person.firstName} ${person.lastName}` })
+          const removed = deletePerson(store, actor, person)
           await writeStore(store)
-          return send(res, 200, personView(person, store))
+          cleanupDeletedFiles(removed, store.documents)
+          return send(res, 200, { ok: true })
         }
       }
     }
@@ -484,12 +484,10 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
       return send(res, 200, vehicleView(store.vehicles[index], store))
     }
     if (req.method === 'DELETE') {
-      const previousStatus = store.vehicles[index].status
-      store.vehicles[index].status = 'Baja'
-      store.vehicles[index].updatedAt = new Date().toISOString()
-      addAudit(store, actor, 'deactivated', 'vehicle', parts[2], { previousStatus, status: 'Baja' })
+      const removed = deleteVehicle(store, actor, store.vehicles[index])
       await writeStore(store)
-      return send(res, 200, vehicleView(store.vehicles[index], store))
+      cleanupDeletedFiles(removed, store.documents)
+      return send(res, 200, { ok: true })
     }
   }
 
