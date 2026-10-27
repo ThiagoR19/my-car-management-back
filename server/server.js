@@ -273,7 +273,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     if (store.accessRequests.some((item) => item.username?.toLowerCase() === username)) return error(res, 409, 'El nombre de usuario ya existe')
     if (store.accessRequests.some((item) => item.email?.toLowerCase() === email)) return error(res, 409, 'El email ya existe')
     if (employeeByUsername || employeeByEmail) {
-      if (!employeeByUsername || employeeByUsername.id !== employeeByEmail?.id) return error(res, 409, 'El usuario y el email deben coincidir con el empleado agregado por el administrador')
+      if (!employeeByUsername || employeeByUsername.id !== employeeByEmail?.id) return error(res, 409, 'El usuario y el email deben coincidir con el usuario agregado por el administrador')
       const employee = employeeByUsername
       if (employee.passwordHash || employee.passwordSalt) return error(res, 409, 'La cuenta ya está registrada. Iniciá sesión con tus credenciales')
       Object.assign(employee, { name, ...passwordRecord(password), updatedAt: new Date().toISOString() })
@@ -335,7 +335,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
       }
       if (req.method === 'POST') {
         const person = validatePerson(body)
-        if (store.people.some((item) => item.identificationType.toUpperCase() === person.identificationType && item.identificationNumber.toUpperCase() === person.identificationNumber)) return error(res, 409, 'Ya existe una persona con esa identificación')
+        if (store.people.some((item) => item.identificationType.toUpperCase() === person.identificationType && item.identificationNumber.toUpperCase() === person.identificationNumber)) return error(res, 409, 'Ya existe un empleado con esa identificación')
         const created = { id: `person-${randomUUID()}`, ...person, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
         store.people.push(created)
         addAudit(store, actor, 'created', 'person', created.id, { name: `${created.firstName} ${created.lastName}` })
@@ -344,11 +344,11 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
       }
     } else {
       const person = store.people.find((item) => item.id === parts[2])
-      if (!person) return error(res, 404, 'Persona no encontrada')
+       if (!person) return error(res, 404, 'Empleado no encontrado')
       if (parts[3] === 'documents' && !parts[4]) {
         if (req.method === 'GET') return send(res, 200, { items: store.documents.filter((doc) => doc.personId === person.id).map((doc) => enrichDocument(doc, store)) })
         if (req.method === 'POST') {
-          if (person.active === false) return error(res, 400, 'La persona está inactiva')
+          if (person.active === false) return error(res, 400, 'El empleado está inactivo')
           const document = validateDocument({ ...body, personId: person.id, active: true }, store)
           if (store.documentTypes.find((type) => type.id === document.typeId)?.active === false) return error(res, 400, 'El tipo de documento está inactivo')
           const id = `pdoc-${randomUUID()}`
@@ -363,7 +363,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
         if (req.method === 'GET') return send(res, 200, personView(person, store))
         if (req.method === 'PUT') {
           const changes = validatePerson({ ...person, ...body })
-          if (store.people.some((item) => item.id !== person.id && item.identificationType.toUpperCase() === changes.identificationType && item.identificationNumber.toUpperCase() === changes.identificationNumber)) return error(res, 409, 'Ya existe una persona con esa identificación')
+           if (store.people.some((item) => item.id !== person.id && item.identificationType.toUpperCase() === changes.identificationType && item.identificationNumber.toUpperCase() === changes.identificationNumber)) return error(res, 409, 'Ya existe un empleado con esa identificación')
           const changedFields = Object.keys(changes).filter((field) => changes[field] !== person[field])
           Object.assign(person, changes, { updatedAt: new Date().toISOString() })
           addAudit(store, actor, 'updated', 'person', person.id, { name: `${person.firstName} ${person.lastName}`, changedFields })
@@ -503,7 +503,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     if (previous.active === false || store.documents.some((item) => item.previousId === previous.id)) return error(res, 409, 'Este documento ya fue renovado o dado de baja. Actualizá la lista antes de continuar')
     if (body.typeId !== undefined && body.typeId !== previous.typeId) return error(res, 400, 'No se puede cambiar el tipo al renovar')
     if (body.vehicleId !== undefined && body.vehicleId !== previous.vehicleId) return error(res, 400, 'No se puede cambiar el vehículo al renovar')
-    if (body.personId !== undefined && body.personId !== previous.personId) return error(res, 400, 'No se puede cambiar la persona al renovar')
+    if (body.personId !== undefined && body.personId !== previous.personId) return error(res, 400, 'No se puede cambiar el empleado al renovar')
     const document = validateDocument({ ...(previous.personId ? { personId: previous.personId } : { vehicleId: previous.vehicleId }), typeId: body.typeId ?? previous.typeId, issueDate: body.issueDate ?? todayIso(new Date(), store.settings.timezone), expirationDate: body.expirationDate, number: body.number ?? previous.number, notes: body.notes ?? '', active: true }, store)
     if (store.documentTypes.find((type) => type.id === document.typeId)?.active === false) return error(res, 400, 'El tipo de documento está inactivo')
     previous.active = false
@@ -803,7 +803,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     const pendingRequest = pendingByUsername || pendingByEmail
     const credentials = pendingRequest
       ? { passwordHash: pendingRequest.passwordHash, passwordSalt: pendingRequest.passwordSalt }
-      // Sin contraseña configurada, el empleado debe completar su registro antes de iniciar sesión.
+      // Sin contraseña configurada, el usuario debe completar su registro antes de iniciar sesión.
       : password ? passwordRecord(password) : { passwordHash: '', passwordSalt: '' }
     const created = { id: `emp-${randomUUID()}`, name: pendingRequest?.name || username, username, email, role: body.role === 'Administrador' ? 'Administrador' : 'Empleado', active: body.active === undefined ? true : body.active === true, createdAt: new Date().toISOString(), ...credentials }
     if (store.employees.some((employee) => employee.email?.toLowerCase() === created.email)) return error(res, 409, 'El email ya existe')
@@ -817,7 +817,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   if (req.method === 'PUT' && parts[1] === 'employees' && parts[2]) {
     if (!requireAdmin(res, actor)) return
     const employee = store.employees.find((item) => item.id === parts[2])
-    if (!employee) return error(res, 404, 'Empleado no encontrado')
+    if (!employee) return error(res, 404, 'Usuario no encontrado')
     validateRole(body)
     if (body.password !== undefined && (typeof body.password !== 'string' || (body.password && body.password.length < 8))) return error(res, 400, 'La contraseña debe tener al menos 8 caracteres')
     if (body.name !== undefined && (typeof body.name !== 'string' || !body.name.trim())) return error(res, 400, 'El nombre es obligatorio')
@@ -839,7 +839,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   if (req.method === 'DELETE' && parts[1] === 'employees' && parts[2]) {
     if (!requireAdmin(res, actor)) return
     const index = store.employees.findIndex((employee) => employee.id === parts[2])
-    if (index < 0) return error(res, 404, 'Empleado no encontrado')
+    if (index < 0) return error(res, 404, 'Usuario no encontrado')
     if (isLastActiveAdmin(store, store.employees[index])) return error(res, 409, 'Debe quedar al menos un administrador con acceso habilitado')
     if (parts[2] === actor.id) return error(res, 400, 'No podés eliminar tu propio acceso')
     const [removed] = store.employees.splice(index, 1)
@@ -880,7 +880,7 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
     return csvResponse(res, [['Patente', 'Unidad', 'Tipo', 'Marca', 'Modelo', 'Año', 'Estado', 'Chasis', 'Motor', 'Color', 'Kilometraje', 'Sucursal', 'Conductor', 'Observaciones'], ...store.vehicles.map((vehicle) => [vehicle.plate, vehicle.unit, typeName(store, vehicle.typeId), vehicle.brand, vehicle.model, vehicle.year, vehicle.status, vehicle.chassis, vehicle.engine, vehicle.color, vehicle.mileage, vehicle.branch, vehicleView(vehicle, store).driver, vehicle.notes])], 'vehiculos.csv')
   }
   if (req.method === 'GET' && parts[1] === 'export' && parts[2] === 'expirations.csv') {
-    return csvResponse(res, [['Patente / persona', 'Vehículo / identificación', 'Documento', 'Vencimiento', 'Días restantes', 'Estado'], ...getExpirations(store, {}).map((item) => [item.ownerLabel, item.personId ? item.personIdentification : item.vehicleName, item.typeName, item.formattedExpirationDate, item.daysRemaining, item.status])], 'vencimientos.csv')
+    return csvResponse(res, [['Patente / empleado', 'Vehículo / identificación', 'Documento', 'Vencimiento', 'Días restantes', 'Estado'], ...getExpirations(store, {}).map((item) => [item.ownerLabel, item.personId ? item.personIdentification : item.vehicleName, item.typeName, item.formattedExpirationDate, item.daysRemaining, item.status])], 'vencimientos.csv')
   }
   return error(res, 404, 'Ruta no encontrada')
 }

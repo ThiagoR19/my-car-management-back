@@ -46,15 +46,15 @@ export function validateVehicle(input, store, previous = null) {
     mileage: integer(input.mileage ?? 0, 'El kilometraje'),
     branch: String(input.branch ?? '').trim(),
     driver: String(input.driver ?? '').trim(),
-    personId: input.personId ? requiredString(input.personId, 'La persona asignada') : null,
+    personId: input.personId ? requiredString(input.personId, 'El empleado asignado') : null,
     notes: String(input.notes ?? '').trim(),
   }
   if (!vehicleStatuses.includes(vehicle.status)) invalid('El estado del vehículo no es válido')
   if (store && !store.vehicleTypes.some((type) => type.id === vehicle.typeId)) invalid('El tipo de vehículo no es válido')
   if (vehicle.personId && store) {
     const person = store.people?.find((item) => item.id === vehicle.personId)
-    if (!person) invalid('La persona asignada no existe')
-    if (person.active === false && previous?.personId !== person.id) invalid('La persona asignada está inactiva')
+    if (!person) invalid('El empleado asignado no existe')
+    if (person.active === false && previous?.personId !== person.id) invalid('El empleado asignado está inactivo')
   }
   return vehicle
 }
@@ -77,7 +77,7 @@ export function validatePerson(input) {
     active: input.active ?? true,
   }
   for (const field of ['firstName', 'lastName', 'identificationType', 'identificationNumber', 'email', 'phone', 'address', 'city', 'province', 'nationality']) {
-    if (person[field].length > 255) invalid('Los datos personales no pueden superar los 255 caracteres por campo')
+    if (person[field].length > 255) invalid('Los datos del empleado no pueden superar los 255 caracteres por campo')
   }
   if (person.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(person.email)) invalid('El email no es válido')
   if (person.birthDate && person.birthDate > todayIso()) invalid('La fecha de nacimiento no puede ser futura')
@@ -91,9 +91,9 @@ function documentDate(value, field) {
 }
 
 export function validateDocument(input, storeOrType) {
-  if (input.personId && input.vehicleId) invalid('El documento debe pertenecer a una persona o a un vehículo')
+  if (input.personId && input.vehicleId) invalid('El documento debe pertenecer a un empleado o a un vehículo')
   const document = {
-    ...(input.personId ? { personId: requiredString(input.personId, 'La persona') } : { vehicleId: requiredString(String(input.vehicleId ?? ''), 'El vehículo') }),
+    ...(input.personId ? { personId: requiredString(input.personId, 'El empleado') } : { vehicleId: requiredString(String(input.vehicleId ?? ''), 'El vehículo') }),
     typeId: requiredString(String(input.typeId ?? ''), 'El tipo de documento'),
     number: String(input.number ?? '').trim(),
     issueDate: documentDate(input.issueDate, 'La fecha de emisión'),
@@ -104,7 +104,7 @@ export function validateDocument(input, storeOrType) {
   const store = Array.isArray(storeOrType?.documentTypes) ? storeOrType : null
   const type = store ? store.documentTypes.find((item) => item.id === document.typeId) : storeOrType
   if (storeOrType && (!type || type.id !== document.typeId)) invalid('El tipo de documento no es válido')
-  if (store && document.personId && !store.people?.some((person) => person.id === document.personId)) invalid('La persona no es válida')
+  if (store && document.personId && !store.people?.some((person) => person.id === document.personId)) invalid('El empleado no es válido')
   if (store && document.vehicleId && !store.vehicles.some((vehicle) => vehicle.id === document.vehicleId)) invalid('El vehículo no es válido')
   if (type?.requiresExpiration === false) document.expirationDate = null
   else if (type && !document.expirationDate) invalid('La fecha de vencimiento es obligatoria para este tipo de documento')
