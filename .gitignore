@@ -4,3 +4,4 @@ node_modules/
 server/data.json
 server/uploads/*
 !server/uploads/.gitkeep
+credenciale.txt
