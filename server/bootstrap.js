@@ -11,7 +11,7 @@ export async function bootstrapAdmin(env = process.env) {
   if (!/^[a-z0-9._-]{3,30}$/.test(username) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 8) throw new Error('Configurá BOOTSTRAP_ADMIN_USERNAME, BOOTSTRAP_ADMIN_EMAIL y BOOTSTRAP_ADMIN_PASSWORD (mínimo 8 caracteres)')
   return withStoreTransaction(async () => {
     const store = await readStore()
-    if (store.employees.length) throw new Error('El alta inicial solo se permite sin empleados existentes')
+    if (store.employees.length) throw new Error('El alta inicial solo se permite sin usuarios existentes')
     store.employees.push({ id: `emp-${randomUUID()}`, username, email, name: env.BOOTSTRAP_ADMIN_NAME?.trim() || username, role: 'Administrador', active: true, createdAt: new Date().toISOString(), ...passwordRecord(password) })
     await writeStore(store)
   })

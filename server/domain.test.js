@@ -27,8 +27,8 @@ test('describe cambios de acceso de empleados', () => {
   const store = { employees: [], vehicles: [], documents: [], vehicleTypes: [], documentTypes: [] }
   const enabled = { employeeName: 'Ana', action: 'access_enabled', entity: 'employee', entityId: 'emp-1', data: { email: 'persona@empresa.com' } }
   const disabled = { employeeName: 'Ana', action: 'access_disabled', entity: 'employee', entityId: 'emp-1', data: { email: 'persona@empresa.com' } }
-  assert.equal(describeAudit(enabled, store), 'Ana habilitó el acceso a empleado persona@empresa.com')
-  assert.equal(describeAudit(disabled, store), 'Ana deshabilitó el acceso a empleado persona@empresa.com')
+  assert.equal(describeAudit(enabled, store), 'Ana habilitó el acceso a usuario persona@empresa.com')
+  assert.equal(describeAudit(disabled, store), 'Ana deshabilitó el acceso a usuario persona@empresa.com')
 })
 
 const expirationStore = (date, settings = {}) => ({

@@ -104,7 +104,7 @@ function auditSubject(item, store) {
   const data = item.data || {}
   if (item.entity === 'person') {
     const person = store.people?.find((candidate) => candidate.id === item.entityId)
-    return `persona ${person ? `${person.firstName} ${person.lastName}` : data.name || item.entityId}`
+    return `empleado ${person ? `${person.firstName} ${person.lastName}` : data.name || item.entityId}`
   }
   if (item.entity === 'vehicle' || item.entity === 'vehicles') {
     const vehicle = store.vehicles.find((candidate) => candidate.id === item.entityId)
@@ -125,7 +125,7 @@ function auditSubject(item, store) {
     const part = (store.parts || []).find((candidate) => candidate.id === item.entityId)
     return `refacción “${part?.name || data.name || item.entityId}”`
   }
-  if (item.entity === 'employee') return `empleado ${data.email || item.entityId}`
+  if (item.entity === 'employee') return `usuario ${data.email || item.entityId}`
   if (item.entity === 'profile') return 'perfil de usuario'
   if (item.entity === 'settings') return 'configuración general'
   return item.entityId || item.entity || 'registro'
@@ -171,7 +171,7 @@ export function describeAudit(item, store) {
     return `${item.employeeName || 'Sistema'} actualizó ${subject}${fields.length ? `: ${fields.join(', ')}` : ''}`
   }
   if (item.action === 'updated' && data.changedFields?.length) {
-    const fieldLabels = { unit: 'unidad', plate: 'patente', typeId: 'tipo', brand: 'marca', model: 'modelo', year: 'año', status: 'estado', number: 'número', issueDate: 'fecha de emisión', expirationDate: 'fecha de vencimiento', notes: 'observaciones', personId: 'persona asignada', firstName: 'nombre', lastName: 'apellido', identificationType: 'tipo de identificación', identificationNumber: 'número de identificación', birthDate: 'fecha de nacimiento', email: 'email', phone: 'teléfono', address: 'domicilio', city: 'localidad', province: 'provincia', nationality: 'nacionalidad', active: 'estado' }
+    const fieldLabels = { unit: 'unidad', plate: 'patente', typeId: 'tipo', brand: 'marca', model: 'modelo', year: 'año', status: 'estado', number: 'número', issueDate: 'fecha de emisión', expirationDate: 'fecha de vencimiento', notes: 'observaciones', personId: 'empleado asignado', firstName: 'nombre', lastName: 'apellido', identificationType: 'tipo de identificación', identificationNumber: 'número de identificación', birthDate: 'fecha de nacimiento', email: 'email', phone: 'teléfono', address: 'domicilio', city: 'localidad', province: 'provincia', nationality: 'nacionalidad', active: 'estado' }
     const fields = data.changedFields.map((field) => fieldLabels[field] || field).join(', ')
     return `${item.employeeName || 'Sistema'} actualizó ${subject}: ${fields}`
   }
