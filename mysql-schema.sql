@@ -252,3 +252,8 @@ ALTER TABLE `person_document_files` ADD CONSTRAINT `person_document_files_docume
 ALTER TABLE `vehicles` ADD COLUMN `person_id` varchar(191) NULL, ADD CONSTRAINT `vehicles_person_id_people_id_fk` FOREIGN KEY (`person_id`) REFERENCES `people` (`id`) ON DELETE set null ON UPDATE no action;
 
 INSERT INTO `__drizzle_migrations` (`hash`, `created_at`) VALUES ('8e999b0e80e5b9ea7a55e99db61e1aff0a62e764da20f0a69cda466a2bdef8f3', 1792886737921);
+
+-- 0002_audit_indexes: historial paginado por fecha y filtrado por entidad.
+CREATE INDEX `audits_created_at_id_idx` ON `audits` (`created_at`,`id`);
+CREATE INDEX `audits_entity_entity_id_idx` ON `audits` (`entity`,`entity_id`);
+INSERT INTO `__drizzle_migrations` (`hash`, `created_at`) VALUES ('53f3640a86054c4f5eaf7b06f2b8b1d8f2de7b55daac9521e3a53c80601fcf50', 1793327863378);

@@ -2,6 +2,7 @@ import { relations, sql } from 'drizzle-orm'
 import {
   boolean,
   date,
+  index,
   int,
   json,
   mysqlEnum,
@@ -210,7 +211,11 @@ export const audits = mysqlTable('audits', {
   entityId: id('entity_id').notNull(),
   data: json('data'),
   createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
-})
+}, (table) => [
+  // El historial se lee paginado por fecha y se filtra por entidad para la ficha de cada vehículo.
+  index('audits_created_at_id_idx').on(table.createdAt, table.id),
+  index('audits_entity_entity_id_idx').on(table.entity, table.entityId),
+])
 
 export const parts = mysqlTable('parts', {
   id: id().primaryKey(),

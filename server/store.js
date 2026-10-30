@@ -174,7 +174,8 @@ export async function readStore(clientOverride) {
   if (clientOverride) return operation.run({ client: clientOverride, baseline: null }, () => readStore())
   if (!operation.getStore()) return withStoreTransaction(() => readStore())
   const client = operation.getStore().client
-  const [employees, accessRequests, vehicleTypes, documentTypes, vehicles, documents, documentFiles, notifications, audits, settings, parts, repairs, sessions, people, personDocuments, personDocumentFiles] = await Promise.all([
+  // El historial no se carga aquí: crece sin límite y se consulta paginado con listAudits.
+  const [employees, accessRequests, vehicleTypes, documentTypes, vehicles, documents, documentFiles, notifications, settings, parts, repairs, sessions, people, personDocuments, personDocumentFiles] = await Promise.all([
     execute(client, 'SELECT id, name, username, email, password_hash AS passwordHash, password_salt AS passwordSalt, role, active, created_at AS createdAt, updated_at AS updatedAt FROM employees ORDER BY created_at'),
     execute(client, 'SELECT id, name, username, email, password_hash AS passwordHash, password_salt AS passwordSalt, created_at AS createdAt FROM access_requests ORDER BY created_at'),
     execute(client, 'SELECT id, name, active, required_document_type_ids AS requiredDocumentTypeIds, created_at AS createdAt, updated_at AS updatedAt FROM vehicle_types ORDER BY name'),
@@ -183,7 +184,6 @@ export async function readStore(clientOverride) {
     execute(client, 'SELECT id, vehicle_id AS vehicleId, type_id AS typeId, number, issue_date AS issueDate, expiration_date AS expirationDate, observations, active, version, previous_id AS previousId, root_id AS rootId, created_at AS createdAt, updated_at AS updatedAt FROM vehicle_documents ORDER BY expiration_date IS NULL, expiration_date'),
     execute(client, 'SELECT id, document_id AS documentId, file_name AS fileName, mime_type AS mimeType, storage_key AS storageKey, size_bytes AS sizeBytes, created_at AS createdAt FROM document_files ORDER BY created_at'),
     execute(client, 'SELECT id, title, description, type, `read`, document_id AS documentId, created_at AS createdAt FROM notifications ORDER BY created_at DESC'),
-    execute(client, 'SELECT id, employee_id AS employeeId, employee_name AS employeeName, employee_email AS employeeEmail, action, entity, entity_id AS entityId, data, created_at AS createdAt FROM audits ORDER BY created_at DESC, id DESC'),
     execute(client, 'SELECT first_alert_days AS firstAlertDays, second_alert_days AS secondAlertDays, urgent_days AS urgentDays, company_name AS companyName, timezone, email_alerts AS emailAlerts FROM app_settings LIMIT 1'),
     execute(client, 'SELECT id, name, stock, unit, min_stock AS minStock, category, created_at AS createdAt, updated_at AS updatedAt FROM parts ORDER BY name'),
     execute(client, 'SELECT id, vehicle_id AS vehicleId, description, date, mileage, notes, parts, employee_id AS employeeId, employee_name AS employeeName, created_at AS createdAt FROM vehicle_repairs ORDER BY date DESC, created_at DESC'),
@@ -192,10 +192,71 @@ export async function readStore(clientOverride) {
     execute(client, 'SELECT id, person_id AS personId, type_id AS typeId, number, issue_date AS issueDate, expiration_date AS expirationDate, observations, active, version, previous_id AS previousId, root_id AS rootId, created_at AS createdAt, updated_at AS updatedAt FROM person_documents ORDER BY expiration_date IS NULL, expiration_date'),
     execute(client, 'SELECT id, document_id AS documentId, file_name AS fileName, mime_type AS mimeType, storage_key AS storageKey, size_bytes AS sizeBytes, created_at AS createdAt FROM person_document_files ORDER BY created_at'),
   ])
-  const store = mapDatabaseStore({ employees, accessRequests, vehicleTypes, documentTypes, vehicles, documents, documentFiles, notifications, audits, settings, parts, repairs, sessions, people, personDocuments, personDocumentFiles })
+  const store = mapDatabaseStore({ employees, accessRequests, vehicleTypes, documentTypes, vehicles, documents, documentFiles, notifications, audits: [], settings, parts, repairs, sessions, people, personDocuments, personDocumentFiles })
   operation.getStore().baseline = structuredClone(store)
   operation.getStore().settingsExists = settings.length > 0
   return store
+}
+
+const auditColumns = 'id, employee_id AS employeeId, employee_name AS employeeName, employee_email AS employeeEmail, action, entity, entity_id AS entityId, data, created_at AS createdAt'
+const mapAudit = (audit) => ({ ...audit, data: parseJson(audit.data) })
+const inList = (values) => values.map(() => '?').join(', ')
+// LIKE con un carácter de escape explícito: el mismo SQL funciona en MySQL y en el adaptador SQLite de las pruebas.
+const likePattern = (text) => `%${String(text).toLowerCase().replace(/[!%_]/g, (character) => `!${character}`)}%`
+
+function inOperation(clientOverride, work) {
+  if (clientOverride) return operation.run({ client: clientOverride, baseline: null }, work)
+  if (!operation.getStore()) return withStoreTransaction(work)
+  return work()
+}
+
+// Página del historial, del más reciente al más antiguo. search compara contra autor, acción,
+// entidad y datos; entities y actions agregan coincidencias por etiqueta traducida.
+export function listAudits({ page = 1, pageSize = 30, search = '', entities = [], actions = [] } = {}, clientOverride) {
+  return inOperation(clientOverride, async () => {
+    const client = operation.getStore().client
+    const conditions = []
+    const values = []
+    if (search) {
+      conditions.push(`(LOWER(CONCAT_WS(' ', employee_name, employee_email, action, entity, entity_id, CAST(data AS CHAR))) LIKE ? ESCAPE '!'${entities.length ? ` OR entity IN (${inList(entities)})` : ''}${actions.length ? ` OR action IN (${inList(actions)})` : ''})`)
+      values.push(likePattern(search), ...entities, ...actions)
+    }
+    const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''
+    const [{ total = 0 } = {}] = await execute(client, `SELECT COUNT(*) AS total FROM audits${where}`, values)
+    const size = Math.min(100, Math.max(1, Math.trunc(Number(pageSize)) || 30))
+    const totalPages = Math.max(1, Math.ceil(Number(total) / size))
+    const current = Math.min(totalPages, Math.max(1, Math.trunc(Number(page)) || 1))
+    // LIMIT/OFFSET van como enteros validados: mysql2 rechaza esos parámetros en sentencias preparadas.
+    const rows = await execute(client, `SELECT ${auditColumns} FROM audits${where} ORDER BY created_at DESC, id DESC LIMIT ${size} OFFSET ${(current - 1) * size}`, values)
+    return { items: rows.map(mapAudit), total: Number(total), page: current, pageSize: size, totalPages }
+  })
+}
+
+// Eventos de un vehículo y de sus documentos para su ficha, una página por vez a partir de un límite.
+// Los documentos de un vehículo solo se borran junto con él, así que alcanza con sus identificadores
+// y la consulta usa el índice (entity, entity_id) en lugar de recorrer el JSON de cada evento.
+// before = { time, mode, id }: 'include' trae también los eventos de ese instante, 'exclude' los descarta
+// y 'id' desempata por identificador, igual que el orden created_at DESC, id DESC.
+export function listVehicleAudits(vehicleId, documentIds = [], { before = null, limit = 20 } = {}, clientOverride) {
+  return inOperation(clientOverride, async () => {
+    const client = operation.getStore().client
+    const scope = `((entity = 'vehicle' AND entity_id = ?)${documentIds.length ? ` OR (entity = 'document' AND entity_id IN (${inList(documentIds)}))` : ''})`
+    const scopeValues = [vehicleId, ...documentIds]
+    const size = Math.min(101, Math.max(1, Math.trunc(Number(limit)) || 20))
+    let boundary = ''
+    const boundaryValues = []
+    if (before) {
+      const time = new Date(before.time)
+      if (before.mode === 'include') { boundary = ' AND created_at <= ?'; boundaryValues.push(time) }
+      else if (before.mode === 'exclude') { boundary = ' AND created_at < ?'; boundaryValues.push(time) }
+      else { boundary = ' AND (created_at < ? OR (created_at = ? AND id < ?))'; boundaryValues.push(time, time, before.id) }
+    }
+    const rows = await execute(client, `SELECT ${auditColumns} FROM audits WHERE ${scope}${boundary} ORDER BY created_at DESC, id DESC LIMIT ${size}`, [...scopeValues, ...boundaryValues])
+    const [{ total = 0 } = {}] = await execute(client, `SELECT COUNT(*) AS total FROM audits WHERE ${scope}`, scopeValues)
+    // Qué vehículo y documentos ya tienen su alta registrada, para no agregar una entrada sintética duplicada.
+    const covered = await execute(client, `SELECT DISTINCT entity, entity_id AS entityId FROM audits WHERE (entity = 'vehicle' AND entity_id = ? AND action = 'created')${documentIds.length ? ` OR (entity = 'document' AND entity_id IN (${inList(documentIds)}) AND action IN ('created', 'renewed'))` : ''}`, scopeValues)
+    return { items: rows.map(mapAudit), total: Number(total), covered: covered.map((row) => `${row.entity}:${row.entityId}`) }
+  })
 }
 
 // Solo las entidades modificadas generan SQL. Nunca se borra y reconstruye la base.

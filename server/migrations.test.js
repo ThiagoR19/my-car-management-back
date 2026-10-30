@@ -8,14 +8,16 @@ const snapshot = idx => JSON.parse(readFileSync(new URL(`meta/${String(idx).padS
 
 test('la cadena de migraciones está registrada como MySQL', () => {
   assert.equal(journal.dialect, 'mysql')
-  assert.equal(journal.entries.length, 2)
+  assert.equal(journal.entries.length, 3)
   const entry = journal.entries[0]
   assert.equal(entry.idx, 0)
   assert.equal(entry.tag, '0000_initial_mysql')
   assert.equal(journal.entries[1].tag, '0001_people')
+  assert.equal(journal.entries[2].tag, '0002_audit_indexes')
   assert.equal(snapshot(1).prevId, snapshot(0).id)
-  assert.deepEqual(readdirSync(migrationsFolder).filter(name => name.endsWith('.sql')), ['0000_initial_mysql.sql', '0001_people.sql'])
-  assert.deepEqual(readdirSync(new URL('meta/', migrationsFolder)).filter(name => name.endsWith('_snapshot.json')), ['0000_snapshot.json', '0001_snapshot.json'])
+  assert.equal(snapshot(2).prevId, snapshot(1).id)
+  assert.deepEqual(readdirSync(migrationsFolder).filter(name => name.endsWith('.sql')), ['0000_initial_mysql.sql', '0001_people.sql', '0002_audit_indexes.sql'])
+  assert.deepEqual(readdirSync(new URL('meta/', migrationsFolder)).filter(name => name.endsWith('_snapshot.json')), ['0000_snapshot.json', '0001_snapshot.json', '0002_snapshot.json'])
 })
 
 test('la migración no contiene sintaxis de PostgreSQL', () => {
@@ -67,4 +69,20 @@ test('el SQL incremental coincide con las columnas y referencias del snapshot', 
     }
     assert.deepEqual(current, table, `La tabla existente ${name} conserva su definición`)
   }
+})
+
+test('los índices del historial se agregan sin tocar datos ni otras tablas', () => {
+  const sql = readFileSync(new URL('0002_audit_indexes.sql', migrationsFolder), 'utf8')
+  assert.doesNotMatch(sql, /DROP|TRUNCATE|DELETE\s+FROM|ALTER\s+TABLE|UPDATE\s/i)
+  assert.match(sql, /CREATE INDEX `audits_created_at_id_idx` ON `audits` \(`created_at`,`id`\)/)
+  assert.match(sql, /CREATE INDEX `audits_entity_entity_id_idx` ON `audits` \(`entity`,`entity_id`\)/)
+  const previous = snapshot(1)
+  const latest = snapshot(2)
+  assert.deepEqual(Object.keys(latest.tables.audits.indexes).sort(), ['audits_created_at_id_idx', 'audits_entity_entity_id_idx'])
+  const current = structuredClone(latest.tables)
+  current.audits.indexes = {}
+  assert.deepEqual(current, previous.tables)
+  const schemaDump = readFileSync(new URL('../mysql-schema.sql', import.meta.url), 'utf8')
+  assert.match(schemaDump, /audits_created_at_id_idx/)
+  assert.match(schemaDump, /audits_entity_entity_id_idx/)
 })

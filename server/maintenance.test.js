@@ -98,7 +98,19 @@ test('el historial conserva repuestos eliminados, documentos renovados y eventos
   const created = await f.request('/repairs', { token, method: 'POST', body: repair() })
   await f.request('/parts/prt-1', { token, method: 'DELETE' })
   await f.request('/documents/doc-1/renew', { token, method: 'POST', body: { expirationDate: '2027-10-19' } })
-  const history = (await f.request('/vehicles/vh-1/history', { token })).body.items
+  // La ficha se recorre por páginas con el cursor; juntas contienen todo el historial sin repetir eventos.
+  const history = []
+  let cursor = null
+  let pages = 0
+  do {
+    const page = (await f.request(`/vehicles/vh-1/history${cursor ? `?cursor=${cursor}` : ''}`, { token })).body
+    assert.ok(page.items.length <= 20)
+    history.push(...page.items)
+    cursor = page.nextCursor
+    pages++
+  } while (cursor)
+  assert.ok(pages > 5)
+  assert.equal(new Set(history.map((item) => item.id)).size, history.length)
   assert.equal(history.filter((item) => item.id.startsWith('old-')).length, 110)
   assert.equal(history.find((item) => item.id === created.body.id).parts[0].name, 'Aceite Sintético 5W-30')
   const eventTimes = history.map((item) => {
@@ -133,4 +145,44 @@ test('la clasificación admite filtrar, renombrar y validar tipos sin perder las
   assert.equal((await f.request('/vehicles/vh-1', { token })).body.type, 'Camión pesado')
   assert.equal((await f.request('/vehicle-types/vt-truck', { token, method: 'DELETE' })).status, 409)
   assert.equal((await f.request('/vehicles/vh-1', { token, method: 'PUT', body: { typeId: 'tipo-inexistente' } })).status, 400)
+})
+
+test('la ficha paginada por cursor no repite ni saltea eventos con horas empatadas', async (t) => {
+  const sameSecond = '2026-10-20T15:30:00.000Z'
+  const f = await fixture(t, (store) => {
+    // Muchos eventos en el mismo segundo (MySQL guarda segundos), intercalados con reparaciones y altas.
+    store.audit = [
+      ...Array.from({ length: 120 }, (_, index) => ({ id: `tie-${String(index).padStart(3, '0')}`, action: 'updated', entity: 'vehicle', entityId: 'vh-1', employeeName: 'Juan', data: { changedFields: ['mileage'] }, createdAt: sameSecond })),
+      ...Array.from({ length: 30 }, (_, index) => ({ id: `doc-event-${index}`, action: 'attached_file', entity: 'document', entityId: 'doc-2', employeeName: 'Ana', data: { fileName: `f${index}.pdf` }, createdAt: new Date(Date.UTC(2026, 9, 1 + index, 9)).toISOString() })),
+      { id: 'other-vehicle', action: 'updated', entity: 'vehicle', entityId: 'vh-2', employeeName: 'Juan', data: {}, createdAt: sameSecond },
+    ]
+    store.repairs = [
+      { id: 'rep-a', vehicleId: 'vh-1', description: 'Frenos', date: '2026-10-20', createdAt: '2026-10-20T15:30:00.000Z', employeeName: 'Juan', parts: [] },
+      { id: 'rep-b', vehicleId: 'vh-1', description: 'Aceite', date: '2026-10-05', createdAt: '2026-10-05T10:00:00.000Z', employeeName: 'Juan', parts: [] },
+    ]
+  })
+  const token = await f.login()
+  const pages = []
+  let cursor = null
+  do {
+    const response = await f.request(`/vehicles/vh-1/history?limit=7${cursor ? `&cursor=${cursor}` : ''}`, { token })
+    assert.equal(response.status, 200)
+    pages.push(response.body)
+    cursor = response.body.nextCursor
+  } while (cursor)
+  const items = pages.flatMap((page) => page.items)
+  const ids = items.map((item) => item.id)
+  assert.equal(new Set(ids).size, ids.length, 'ningún evento se repite')
+  // 120 + 30 eventos del vehículo, 2 reparaciones y las altas de la unidad y de sus documentos sin evento registrado.
+  assert.equal(items.length, pages[0].total)
+  assert.ok(ids.includes('tie-000') && ids.includes('tie-119') && ids.includes('rep-a') && ids.includes('rep-b') && ids.includes('registered-vh-1'))
+  assert.ok(!ids.includes('other-vehicle'))
+  assert.ok(pages.slice(0, -1).every((page) => page.items.length === 7 && page.hasMore))
+  assert.equal(pages.at(-1).hasMore, false)
+  const times = items.map((item) => new Date(item.date && item.date.length === 10 ? `${item.date}T12:00:00Z` : item.date || item.createdAt).getTime())
+  assert.deepEqual(times, [...times].sort((a, b) => b - a))
+
+  assert.equal((await f.request('/vehicles/vh-1/history?cursor=no-es-un-cursor', { token })).status, 400)
+  assert.equal((await f.request('/vehicles/vh-1/history?limit=5000', { token })).body.items.length, 100)
+  assert.equal((await f.request('/vehicles/vh-1/history', { token })).body.items.length, 20)
 })

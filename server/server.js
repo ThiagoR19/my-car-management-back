@@ -6,8 +6,10 @@ import { scryptSync, timingSafeEqual, randomUUID, createHash } from 'node:crypto
 import cors from 'cors'
 import { addAudit, dashboard, describeAudit, enrichDocument, getExpirations, isVehicleDocumentationIncomplete, todayIso } from './domain.js'
 import { passwordRecord, readStore, uploadsDir, writeStore, withStoreTransaction } from './store.js'
+const defaultReadStore = readStore
 import { csvEscape, parseCsv, validateDocument, validateSettings, validateVehicle, validatePerson, validateDocumentType, validateBooleans, integer, invalid, ValidationError } from './validation.js'
-import { recordRepair, vehicleHistory } from './maintenance.js'
+import { decodeHistoryCursor, recordRepair, vehicleDocumentIds, vehicleHistoryPage, VEHICLE_HISTORY_MAX_PAGE_SIZE, VEHICLE_HISTORY_PAGE_SIZE } from './maintenance.js'
+import { auditQuery, databaseAudits, memoryAudits } from './audits.js'
 import { cleanupDeletedFiles, deletePerson, deleteVehicle } from './deletion.js'
 import { buildEmailReport, createMailer, deliverEmail, emailConfig, logSmtpError, runScheduledEmail, sendTestEmail, smtpErrorMessage, validateEmailConfig } from './email.js'
 
@@ -226,8 +228,9 @@ function csvResponse(res, rows, filename) {
   send(res, 200, `${csv}\n`, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${filename}"` })
 }
 
-async function handle(req, res, context = { readStore, writeStore, now: Date.now, sessionTtlMs: 43200000 }, providedBody) {
+async function handle(req, res, context = { readStore, writeStore, audits: databaseAudits, now: Date.now, sessionTtlMs: 43200000 }, providedBody) {
   const { readStore, writeStore, now, sessionTtlMs } = context
+  const audits = context.audits || (readStore === defaultReadStore ? databaseAudits : memoryAudits)
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
   const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent)
   const api = parts[0] === 'api'
@@ -432,7 +435,10 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   if (req.method === 'GET' && parts[1] === 'vehicles' && parts[2] && parts[3] === 'history' && !parts[4]) {
     const vehicle = store.vehicles.find((item) => item.id === parts[2])
     if (!vehicle) return error(res, 404, 'Vehículo no encontrado')
-    return send(res, 200, { items: vehicleHistory(store, vehicle) })
+    // Ficha paginada por cursor: ?cursor=<nextCursor de la página anterior>&limit=20 (máximo 100).
+    const requestedLimit = Number(url.searchParams.get('limit'))
+    const options = { cursor: decodeHistoryCursor(url.searchParams.get('cursor')), limit: Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, VEHICLE_HISTORY_MAX_PAGE_SIZE) : VEHICLE_HISTORY_PAGE_SIZE }
+    return send(res, 200, vehicleHistoryPage(store, vehicle, await audits.forVehicle(store, vehicle, vehicleDocumentIds(store, vehicle), options), options))
   }
 
   if (req.method === 'GET' && parts[1] === 'vehicles' && !parts[2]) {
@@ -657,7 +663,8 @@ async function handle(req, res, context = { readStore, writeStore, now: Date.now
   }
   if (req.method === 'GET' && parts[1] === 'audit') {
     if (!requireAdmin(res, actor)) return
-    return send(res, 200, { items: store.audit.map((item) => ({ ...item, description: describeAudit(item, store) })) })
+    const result = await audits.list(store, auditQuery(url.searchParams))
+    return send(res, 200, { ...result, items: result.items.map((item) => ({ ...item, description: describeAudit(item, store) })) })
   }
 
   if (parts[1] === 'parts') {

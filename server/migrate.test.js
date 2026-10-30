@@ -23,11 +23,11 @@ function database({ applied = [{ hash: 'legacy-hash', created_at: 1792800337921 
   return { calls, client, createConnection: async () => client }
 }
 
-test('--check consulta la migración incremental pendiente sin modificar la base', async () => {
+test('--check consulta las migraciones incrementales pendientes sin modificar la base', async () => {
   const adapter = database()
   let applied = false
   const result = await migrateDatabase({ databaseUrl, checkOnly: true, createConnection: adapter.createConnection, applyMigrations: () => { applied = true }, log: () => {} })
-  assert.deepEqual(result, { pending: 1, applied: 0 })
+  assert.deepEqual(result, { pending: 2, applied: 0 })
   assert.equal(applied, false)
   assert.ok(adapter.calls.filter(call => call !== 'CLOSE').every(call => call.startsWith('SELECT ')))
   assert.equal(adapter.calls.some(call => call.includes('GET_LOCK')), false)
@@ -42,7 +42,7 @@ test('acepta el registro inicial antiguo y mantiene el bloqueo en la conexión d
     assert.match(adapter.calls.at(-1), /GET_LOCK/)
     applied = true
   }, log: () => {} })
-  assert.deepEqual(result, { pending: 1, applied: 1 })
+  assert.deepEqual(result, { pending: 2, applied: 2 })
   assert.equal(applied, true)
   assert.match(adapter.calls.at(-2), /RELEASE_LOCK/)
   assert.equal(adapter.calls.at(-1), 'CLOSE')
@@ -54,11 +54,14 @@ test('un esquema existente sin historial se detiene antes de ejecutar DDL', asyn
   assert.ok(adapter.calls.filter(call => call !== 'CLOSE').every(call => call.startsWith('SELECT ')))
 })
 
-test('una base vacía puede ejecutar las dos migraciones y una actualizada no repite DDL', async () => {
+test('una base vacía puede ejecutar todas las migraciones y una actualizada no repite DDL', async () => {
   const fresh = database({ applied: [] })
   const freshResult = await migrateDatabase({ databaseUrl, checkOnly: true, createConnection: fresh.createConnection, log: () => {} })
-  assert.equal(freshResult.pending, 2)
-  const current = database({ applied: [{ hash: 'current', created_at: 1792886737921 }] })
+  assert.equal(freshResult.pending, 3)
+  // Una base con personas ya migradas solo agrega los índices del historial.
+  const withPeople = database({ applied: [{ hash: 'people', created_at: 1792886737921 }] })
+  assert.deepEqual(await migrateDatabase({ databaseUrl, checkOnly: true, createConnection: withPeople.createConnection, log: () => {} }), { pending: 1, applied: 0 })
+  const current = database({ applied: [{ hash: 'current', created_at: 1793327863378 }] })
   const result = await migrateDatabase({ databaseUrl, createConnection: current.createConnection, applyMigrations: () => assert.fail('No debe migrar'), log: () => {} })
   assert.deepEqual(result, { pending: 0, applied: 0 })
   assert.equal(current.calls.some(call => call.includes('GET_LOCK')), false)

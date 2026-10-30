@@ -233,12 +233,31 @@ test('no se puede degradar, desactivar o eliminar al último administrador activ
   assert.equal((await api.request(`/employees/${created.body.id}`, { method: 'PUT', token: secondToken, body: { role: 'Empleado' } })).status, 409)
 })
 
-test('el historial API conserva acceso a más de cien eventos', async () => {
+test('el historial API conserva acceso a más de cien eventos mediante páginas', async () => {
   const audit = Array.from({ length: 130 }, (_, index) => ({ id: `audit-${index}`, entity: 'profile', entityId: 'admin', action: 'updated', employeeName: 'Admin', data: {} }))
   const api = fixture({ audit })
-  const result = await api.request('/audit', { token: await api.login() })
-  assert.equal(result.status, 200)
-  assert.equal(result.body.items.length, 130)
+  const token = await api.login()
+  const first = await api.request('/audit', { token })
+  assert.equal(first.status, 200)
+  assert.deepEqual({ total: first.body.total, page: first.body.page, pageSize: first.body.pageSize, totalPages: first.body.totalPages }, { total: 130, page: 1, pageSize: 30, totalPages: 5 })
+  assert.deepEqual(first.body.items.map((item) => item.id), audit.slice(0, 30).map((item) => item.id))
+  const last = await api.request('/audit?page=5', { token })
+  assert.deepEqual(last.body.items.map((item) => item.id), audit.slice(120).map((item) => item.id))
+  // Valores fuera de rango no fallan: la página se ajusta y el tamaño queda acotado a 100.
+  assert.equal((await api.request('/audit?page=99', { token })).body.page, 5)
+  assert.equal((await api.request('/audit?page=-3&pageSize=abc', { token })).body.page, 1)
+  assert.equal((await api.request('/audit?pageSize=5000', { token })).body.items.length, 100)
+})
+
+test('el historial API busca en todo el historial y vuelve a contar las páginas', async () => {
+  const audit = Array.from({ length: 70 }, (_, index) => ({ id: `audit-${index}`, entity: 'vehicle', entityId: 'vh-1', action: index % 10 === 0 ? 'renewed' : 'updated', employeeName: index === 65 ? 'Carla Gómez' : 'Admin', data: { plate: `AB${index}CD` } }))
+  const api = fixture({ audit })
+  const token = await api.login()
+  const renewed = await api.request(`/audit?q=${encodeURIComponent('renovó')}`, { token })
+  assert.deepEqual({ total: renewed.body.total, totalPages: renewed.body.totalPages }, { total: 7, totalPages: 1 })
+  assert.ok(renewed.body.items.every((item) => item.action === 'renewed'))
+  assert.deepEqual((await api.request('/audit?q=gomez', { token })).body.items.map((item) => item.id), ['audit-65'])
+  assert.deepEqual((await api.request('/audit?q=AB42CD', { token })).body.items.map((item) => item.id), ['audit-42'])
 })
 
 test('configuración rechaza umbrales negativos, fraccionarios, desordenados y zonas inexistentes', async () => {

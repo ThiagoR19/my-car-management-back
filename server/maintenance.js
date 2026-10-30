@@ -47,24 +47,58 @@ export function recordRepair(store, actor, input) {
   return repair
 }
 
-export function vehicleHistory(store, vehicle) {
-  const documents = store.documents.filter((item) => item.vehicleId === vehicle.id)
-  const documentIds = new Set(documents.map((item) => item.id))
-  const items = store.audit.filter((item) => (item.entity === 'vehicle' && item.entityId === vehicle.id) || (item.entity === 'document' && (documentIds.has(item.entityId) || item.data?.vehicleId === vehicle.id))).map((item) => ({ ...item, kind: item.entity, description: describeAudit(item, store) }))
-  if (!items.some((item) => item.entity === 'vehicle' && item.action === 'created')) {
-    items.push({ id: `registered-${vehicle.id}`, kind: 'vehicle', description: `Alta del vehículo ${vehicle.plate}`, createdAt: vehicle.createdAt })
-  }
-  for (const document of documents) {
-    if (items.some((item) => item.entityId === document.id && ['created', 'renewed'].includes(item.action))) continue
+export const vehicleDocumentIds = (store, vehicle) => store.documents.filter((item) => item.vehicleId === vehicle.id).map((item) => item.id)
+
+export const VEHICLE_HISTORY_PAGE_SIZE = 20
+export const VEHICLE_HISTORY_MAX_PAGE_SIZE = 100
+
+const isoValue = (value) => value instanceof Date ? value.toISOString() : String(value || '')
+function eventTime(item) {
+  const value = item.date || item.createdAt
+  return value ? new Date(value.length === 10 ? `${value}T12:00:00Z` : value).getTime() || 0 : 0
+}
+
+// Orden total del historial de la unidad: más reciente primero; los empates se resuelven por fecha de
+// creación e identificador, así un cursor nunca repite ni saltea eventos.
+export const historyKey = (item) => [eventTime(item), isoValue(item.createdAt), String(item.id)]
+const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0
+export const compareHistoryKeys = (a, b) => b[0] - a[0] || compareText(b[1], a[1]) || compareText(b[2], a[2])
+export const isAfterHistoryKey = (cursor, key) => !cursor || compareHistoryKeys(cursor, key) < 0
+
+export const encodeHistoryCursor = (key) => Buffer.from(JSON.stringify(key)).toString('base64url')
+export function decodeHistoryCursor(value) {
+  if (!value) return null
+  try {
+    const key = JSON.parse(Buffer.from(String(value), 'base64url').toString('utf8'))
+    if (Array.isArray(key) && key.length === 3 && Number.isFinite(key[0]) && typeof key[1] === 'string' && typeof key[2] === 'string') return key
+  } catch { /* Se informa abajo como cursor inválido. */ }
+  throw Object.assign(new Error('El cursor del historial no es válido'), { statusCode: 400 })
+}
+
+// Traduce el cursor al límite SQL de los eventos guardados, cuya clave es [created_at, created_at, id].
+export function auditBoundary(cursor) {
+  if (!cursor) return null
+  const tie = new Date(cursor[0]).toISOString()
+  return { time: cursor[0], mode: tie < cursor[1] ? 'include' : tie > cursor[1] ? 'exclude' : 'id', id: cursor[2] }
+}
+
+// Una página de la ficha: intercala los eventos guardados (ya filtrados por vehículo y cursor, uno más que
+// el límite), las reparaciones y las altas sin evento registrado, del más reciente al más antiguo.
+export function vehicleHistoryPage(store, vehicle, { items: audits, total, covered }, { cursor = null, limit = VEHICLE_HISTORY_PAGE_SIZE } = {}) {
+  const coveredKeys = new Set(covered)
+  const others = []
+  if (!coveredKeys.has(`vehicle:${vehicle.id}`)) others.push({ id: `registered-${vehicle.id}`, kind: 'vehicle', description: `Alta del vehículo ${vehicle.plate}`, createdAt: vehicle.createdAt })
+  for (const document of store.documents.filter((item) => item.vehicleId === vehicle.id)) {
+    if (coveredKeys.has(`document:${document.id}`)) continue
     const type = store.documentTypes.find((item) => item.id === document.typeId)
-    items.push({ id: `registered-${document.id}`, kind: 'document', description: `${document.previousId ? 'Renovación' : 'Carga'} de ${type?.name || 'documento'}${document.number ? ` · ${document.number}` : ''}`, createdAt: document.createdAt || document.issueDate || vehicle.createdAt })
+    others.push({ id: `registered-${document.id}`, kind: 'document', description: `${document.previousId ? 'Renovación' : 'Carga'} de ${type?.name || 'documento'}${document.number ? ` · ${document.number}` : ''}`, createdAt: document.createdAt || document.issueDate || vehicle.createdAt })
   }
   for (const repair of store.repairs || []) {
-    if (repair.vehicleId === vehicle.id) items.push({ id: repair.id, kind: 'repair', description: repair.description, date: repair.date, createdAt: repair.createdAt, employeeName: repair.employeeName, mileage: repair.mileage, notes: repair.notes, parts: repair.parts })
+    if (repair.vehicleId === vehicle.id) others.push({ id: repair.id, kind: 'repair', description: repair.description, date: repair.date, createdAt: repair.createdAt, employeeName: repair.employeeName, mileage: repair.mileage, notes: repair.notes, parts: repair.parts })
   }
-  const eventTime = (item) => {
-    const value = item.date || item.createdAt
-    return value ? new Date(value.length === 10 ? `${value}T12:00:00Z` : value).getTime() || 0 : 0
-  }
-  return items.sort((a, b) => eventTime(b) - eventTime(a) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+  const events = audits.map((item) => ({ ...item, kind: item.entity, description: describeAudit(item, store) }))
+  const remaining = [...events, ...others].filter((item) => isAfterHistoryKey(cursor, historyKey(item))).sort((a, b) => compareHistoryKeys(historyKey(a), historyKey(b)))
+  const items = remaining.slice(0, limit)
+  const hasMore = remaining.length > limit
+  return { items, total: total + others.length, hasMore, nextCursor: hasMore ? encodeHistoryCursor(historyKey(items.at(-1))) : null }
 }

@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { addAudit } from './domain.js'
 import { deletePerson, deleteVehicle } from './deletion.js'
-import { readStore, writeStore } from './store.js'
+import { listAudits, listVehicleAudits, readStore, writeStore } from './store.js'
 
 // Run the repository's actual SQL against an isolated relational database. This
 // adapter only binds tagged-template parameters and maps driver value types; it
@@ -13,6 +13,8 @@ import { readStore, writeStore } from './store.js'
 function isolatedDatabase(snapshotName = '0001_snapshot.json', { rawBooleans = false, mysqlDateOffset } = {}) {
   const database = new DatabaseSync(':memory:')
   database.exec('PRAGMA foreign_keys = ON')
+  // SQLite ya devuelve texto sin comillas desde JSON_EXTRACT; MySQL y MariaDB necesitan JSON_UNQUOTE.
+  database.function('JSON_UNQUOTE', (value) => value)
   const snapshot = JSON.parse(readFileSync(new URL(`../drizzle/migrations/meta/${snapshotName}`, import.meta.url), 'utf8'))
   const quote = (name) => `"${name.replaceAll('"', '""')}"`
   for (const table of Object.values(snapshot.tables)) {
@@ -82,12 +84,13 @@ test('conserva más de 100 auditorías, incluso cuando un guardado no incluye to
   const initial = fixture()
   for (let index = 0; index < 150; index++) addAudit(initial, initial.employees[1], 'created', 'vehicle', 'v')
   await writeStore(initial, client)
+  // readStore ya no trae el historial: cada guardado solo inserta los eventos nuevos.
   const loaded = await readStore(client)
-  assert.equal(loaded.audit.length, 150)
-  loaded.audit = loaded.audit.slice(0, 1)
+  assert.deepEqual(loaded.audit, [])
+  assert.equal((await listAudits({}, client)).total, 150)
   addAudit(loaded, loaded.employees[0], 'updated', 'vehicle', 'v')
   await writeStore(loaded, client)
-  assert.equal((await readStore(client)).audit.length, 151)
+  assert.equal((await listAudits({}, client)).total, 151)
 })
 
 test('los booleanos que MySQL devuelve como 0/1 se leen como true/false', async (t) => {
@@ -118,13 +121,14 @@ test('el autor histórico permanece al renombrar o eliminar al empleado', async 
   await writeStore(initial, client)
   let loaded = await readStore(client)
   loaded.employees[1].name = 'Otro nombre'
+  loaded.audit = (await listAudits({}, client)).items
   loaded.audit[0].employeeName = 'Intento de modificar el historial'
   await writeStore(loaded, client)
+  assert.equal((await listAudits({}, client)).items[0].employeeName, 'ana')
   loaded = await readStore(client)
-  assert.equal(loaded.audit[0].employeeName, 'ana')
   loaded.employees = loaded.employees.filter((employee) => employee.id !== 'ana')
   await writeStore(loaded, client)
-  const historical = (await readStore(client)).audit[0]
+  const historical = (await listAudits({}, client)).items[0]
   assert.equal(historical.employeeName, 'ana')
   assert.equal(historical.employeeEmail, 'ana@example.com')
   assert.equal(historical.employeeId, null)
@@ -316,8 +320,9 @@ test('la eliminación de personas persiste sin referencias huérfanas y conserva
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_document_files').get().count, 0)
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_documents').get().count, 0)
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM document_files').get().count, 1)
-  assert.equal(persisted.audit[0].action, 'deleted')
-  assert.equal(persisted.audit[0].data.name, 'Ana Pérez')
+  const [deletion] = (await listAudits({}, client)).items
+  assert.equal(deletion.action, 'deleted')
+  assert.equal(deletion.data.name, 'Ana Pérez')
 })
 
 test('la eliminación de vehículos persiste con sus archivos y reparaciones sin afectar personas ni stock', async (t) => {
@@ -348,6 +353,65 @@ test('la eliminación de vehículos persiste con sus archivos y reparaciones sin
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM vehicle_documents').get().count, 0)
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM document_files').get().count, 0)
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM person_document_files').get().count, 1)
-  assert.equal(persisted.audit[0].action, 'deleted')
-  assert.equal(persisted.audit[0].data.plate, 'AA000AA')
+  const [deletion] = (await listAudits({}, client)).items
+  assert.equal(deletion.action, 'deleted')
+  assert.equal(deletion.data.plate, 'AA000AA')
+})
+
+test('el historial se pagina en la base, del más reciente al más antiguo, con búsqueda y etiquetas', async (t) => {
+  const { database, client } = isolatedDatabase()
+  t.after(() => database.close())
+  const initial = fixture()
+  const event = (index, changes = {}) => ({ id: `a-${String(index).padStart(3, '0')}`, employeeId: 'admin', employeeName: 'admin', employeeEmail: 'admin@example.com', action: 'updated', entity: 'vehicle', entityId: 'v', data: { plate: 'AA000AA' }, createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(), ...changes })
+  initial.audit = Array.from({ length: 75 }, (_, index) => event(index))
+  initial.audit.push(event(80, { action: 'renewed', entity: 'document', entityId: 'd', data: { vehicleId: 'v', number: 'RTO 50%_especial' } }))
+  await writeStore(initial, client)
+
+  const first = await listAudits({ page: 1, pageSize: 30 }, client)
+  assert.deepEqual({ total: first.total, page: first.page, totalPages: first.totalPages, size: first.items.length }, { total: 76, page: 1, totalPages: 3, size: 30 })
+  assert.equal(first.items[0].id, 'a-080')
+  assert.equal(first.items[1].id, 'a-074')
+  assert.deepEqual(first.items[0].data, { vehicleId: 'v', number: 'RTO 50%_especial' })
+  const last = await listAudits({ page: 3, pageSize: 30 }, client)
+  assert.deepEqual(last.items.map((item) => item.id), Array.from({ length: 16 }, (_, index) => `a-${String(15 - index).padStart(3, '0')}`))
+  assert.equal((await listAudits({ page: 9, pageSize: 30 }, client)).page, 3)
+
+  // Búsqueda por datos guardados, por etiqueta traducida y con comodines de LIKE escapados.
+  assert.equal((await listAudits({ search: 'AA000AA' }, client)).total, 75)
+  assert.equal((await listAudits({ search: 'renovó', actions: ['renewed'] }, client)).items[0].id, 'a-080')
+  assert.equal((await listAudits({ search: '50%_esp' }, client)).total, 1)
+  assert.equal((await listAudits({ search: '5_%' }, client)).total, 0)
+  assert.equal((await listAudits({ search: 'no-existe' }, client)).total, 0)
+
+  // La ficha de la unidad pide de a una página los eventos del vehículo y de sus documentos.
+  const firstVehiclePage = await listVehicleAudits('v', ['d'], { limit: 21 }, client)
+  assert.equal(firstVehiclePage.total, 76)
+  assert.deepEqual(firstVehiclePage.covered, ['document:d'])
+  assert.equal(firstVehiclePage.items.length, 21)
+  assert.equal(firstVehiclePage.items[0].id, 'a-080')
+  const boundary = firstVehiclePage.items[19]
+  const nextVehiclePage = await listVehicleAudits('v', ['d'], { before: { time: new Date(boundary.createdAt).getTime(), mode: 'id', id: boundary.id }, limit: 21 }, client)
+  assert.equal(nextVehiclePage.items[0].id, firstVehiclePage.items[20].id)
+  const newestTime = new Date(firstVehiclePage.items[0].createdAt).getTime()
+  assert.equal((await listVehicleAudits('v', ['d'], { before: { time: newestTime, mode: 'include' }, limit: 1 }, client)).items[0].id, 'a-080')
+  assert.equal((await listVehicleAudits('v', ['d'], { before: { time: newestTime, mode: 'exclude' }, limit: 1 }, client)).items[0].id, 'a-074')
+  assert.equal((await listVehicleAudits('otro', [], {}, client)).total, 0)
+  assert.equal((await listVehicleAudits('v', [], {}, client)).total, 75)
+})
+
+test('cargar y guardar el store no lee ni reescribe el historial existente', async (t) => {
+  const { database, client } = isolatedDatabase()
+  t.after(() => database.close())
+  const initial = fixture()
+  for (let index = 0; index < 40; index++) addAudit(initial, initial.employees[0], 'created', 'vehicle', 'v')
+  await writeStore(initial, client)
+  const statements = []
+  const tracingClient = Object.assign((strings, ...values) => { statements.push(strings.join('?')); return client(strings, ...values) }, client)
+  const loaded = await readStore(tracingClient)
+  loaded.vehicles[0].brand = 'Otra marca'
+  addAudit(loaded, loaded.employees[0], 'updated', 'vehicle', 'v')
+  await writeStore(loaded, tracingClient)
+  assert.ok(!statements.some((statement) => /FROM\s+audits/i.test(statement)), 'readStore no debe consultar la tabla audits')
+  assert.equal(statements.filter((statement) => /INTO\s+audits/i.test(statement)).length, 1)
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM audits').get().count, 41)
 })
