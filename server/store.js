@@ -218,8 +218,11 @@ export function listAudits({ page = 1, pageSize = 30, search = '', entities = []
     const conditions = []
     const values = []
     if (search) {
-      conditions.push(`(LOWER(CONCAT_WS(' ', employee_name, employee_email, action, entity, entity_id, CAST(data AS CHAR))) LIKE ? ESCAPE '!'${entities.length ? ` OR entity IN (${inList(entities)})` : ''}${actions.length ? ` OR action IN (${inList(actions)})` : ''})`)
-      values.push(likePattern(search), ...entities, ...actions)
+      // Cada columna se compara por separado: unirlas con CONCAT mezclaría la collation de la tabla
+      // con la de la conexión (CAST) y MySQL/MariaDB responderían "Illegal mix of collations".
+      const columns = ['employee_name', 'employee_email', 'action', 'entity', 'entity_id', 'CAST(data AS CHAR)']
+      conditions.push(`(${columns.map((column) => `LOWER(${column}) LIKE ? ESCAPE '!'`).join(' OR ')}${entities.length ? ` OR entity IN (${inList(entities)})` : ''}${actions.length ? ` OR action IN (${inList(actions)})` : ''})`)
+      values.push(...columns.map(() => likePattern(search)), ...entities, ...actions)
     }
     const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''
     const [{ total = 0 } = {}] = await execute(client, `SELECT COUNT(*) AS total FROM audits${where}`, values)

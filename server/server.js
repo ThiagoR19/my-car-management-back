@@ -892,9 +892,9 @@ async function handle(req, res, context = { readStore, writeStore, audits: datab
   return error(res, 404, 'Ruta no encontrada')
 }
 
-export function createApiServer({ readStore: loadStore = readStore, writeStore: saveStore = writeStore, mailer = createMailer(), emailScheduler = false, now = Date.now, sessionTtlMs = 43200000, corsOrigins = parseCorsOrigins(), withTransaction = loadStore === readStore ? withStoreTransaction : (work) => work() } = {}) {
+export function createApiServer({ readStore: loadStore = readStore, writeStore: saveStore = writeStore, audits, mailer = createMailer(), emailScheduler = false, now = Date.now, sessionTtlMs = 43200000, corsOrigins = parseCorsOrigins(), withTransaction = loadStore === readStore ? withStoreTransaction : (work) => work() } = {}) {
   if (!Number.isSafeInteger(sessionTtlMs) || sessionTtlMs <= 0) throw new Error('La duración de sesión debe ser un entero positivo')
-  const context = { readStore: loadStore, writeStore: saveStore, mailer, now, sessionTtlMs }
+  const context = { readStore: loadStore, writeStore: saveStore, audits, mailer, now, sessionTtlMs }
   const corsMiddleware = createCorsMiddleware(corsOrigins)
   let mutations = Promise.resolve()
   const rateLimitBuckets = new Map()

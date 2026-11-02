@@ -3,8 +3,11 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { addAudit } from './domain.js'
+import { auditBoundary } from './maintenance.js'
 import { deletePerson, deleteVehicle } from './deletion.js'
 import { listAudits, listVehicleAudits, readStore, writeStore } from './store.js'
+import { createApiServer } from './server.js'
+import { seedDatabase } from './test-fixtures.js'
 
 // Run the repository's actual SQL against an isolated relational database. This
 // adapter only binds tagged-template parameters and maps driver value types; it
@@ -13,8 +16,6 @@ import { listAudits, listVehicleAudits, readStore, writeStore } from './store.js
 function isolatedDatabase(snapshotName = '0001_snapshot.json', { rawBooleans = false, mysqlDateOffset } = {}) {
   const database = new DatabaseSync(':memory:')
   database.exec('PRAGMA foreign_keys = ON')
-  // SQLite ya devuelve texto sin comillas desde JSON_EXTRACT; MySQL y MariaDB necesitan JSON_UNQUOTE.
-  database.function('JSON_UNQUOTE', (value) => value)
   const snapshot = JSON.parse(readFileSync(new URL(`../drizzle/migrations/meta/${snapshotName}`, import.meta.url), 'utf8'))
   const quote = (name) => `"${name.replaceAll('"', '""')}"`
   for (const table of Object.values(snapshot.tables)) {
@@ -414,4 +415,96 @@ test('cargar y guardar el store no lee ni reescribe el historial existente', asy
   assert.ok(!statements.some((statement) => /FROM\s+audits/i.test(statement)), 'readStore no debe consultar la tabla audits')
   assert.equal(statements.filter((statement) => /INTO\s+audits/i.test(statement)).length, 1)
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM audits').get().count, 41)
+})
+
+test('flujo completo por HTTP sobre SQL: las acciones quedan en el historial y se leen por páginas', async (t) => {
+  const { database, client } = isolatedDatabase()
+  await writeStore(seedDatabase(), client)
+  // Mismas rutas que producción; solo cambia el cliente SQL.
+  const server = createApiServer({
+    readStore: () => readStore(client),
+    writeStore: (data) => writeStore(data, client),
+    audits: {
+      list: (_store, query) => listAudits(query, client),
+      forVehicle: (_store, vehicle, documentIds, { cursor, limit }) => listVehicleAudits(vehicle.id, documentIds, { before: auditBoundary(cursor), limit: limit + 1 }, client),
+    },
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(async () => { await new Promise((resolve) => { server.close(resolve); server.closeAllConnections() }); database.close() })
+  const request = async (path, { token, body, method = 'GET' } = {}) => {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api${path}`, { method, headers: { 'Content-Type': 'application/json', ...(token && { Authorization: `Bearer ${token}` }) }, ...(body && { body: JSON.stringify(body) }) })
+    return { status: response.status, body: await response.json() }
+  }
+  const login = async (identifier, password) => (await request('/auth/login', { method: 'POST', body: { identifier, password } })).body.token
+  const token = await login('admin', 'admin1234')
+  assert.ok(token)
+
+  // Control de acceso del historial.
+  assert.equal((await request('/audit')).status, 401)
+  assert.equal((await request('/audit', { token: await login('ana', 'manager1234') })).status, 403)
+  assert.deepEqual((await request('/audit', { token })).body.items, [])
+
+  // Acciones reales: alta, documento, renovación, reparación y ediciones repetidas.
+  const vehicle = (await request('/vehicles', { method: 'POST', token, body: { unit: '77', plate: 'ZZ777ZZ', typeId: 'vt-truck', brand: 'Volvo', model: 'FH' } })).body
+  assert.ok(vehicle.id)
+  const document = (await request(`/vehicles/${vehicle.id}/documents`, { method: 'POST', token, body: { typeId: 'dt-rto', expirationDate: '2027-05-01' } })).body
+  assert.ok(document.id)
+  assert.equal((await request(`/documents/${document.id}/renew`, { method: 'POST', token, body: { expirationDate: '2028-05-01' } })).status, 201)
+  assert.equal((await request('/repairs', { method: 'POST', token, body: { vehicleId: vehicle.id, date: '2026-10-19', description: 'Cambio de aceite', parts: [{ partId: 'prt-1', quantity: 2 }] } })).status, 201)
+  for (let index = 1; index <= 35; index++) assert.equal((await request(`/vehicles/${vehicle.id}`, { method: 'PUT', token, body: { mileage: index * 100 } })).status, 200)
+  // Una acción sobre otro vehículo no debe aparecer en la ficha de este.
+  assert.equal((await request('/vehicles/vh-1', { method: 'PUT', token, body: { mileage: 999999 } })).status, 200)
+  const expectedTotal = database.prepare('SELECT COUNT(*) AS count FROM audits').get().count
+  assert.ok(expectedTotal >= 40)
+
+  // Empate de horas, como en MySQL, que guarda segundos.
+  database.prepare("UPDATE audits SET created_at = '2026-10-20T15:30:00.000Z' WHERE entity = 'vehicle'").run()
+
+  // Historial general: páginas sin repetidos y con descripción traducida.
+  const first = (await request('/audit', { token })).body
+  assert.deepEqual({ total: first.total, page: first.page, pageSize: first.pageSize, totalPages: first.totalPages }, { total: expectedTotal, page: 1, pageSize: 30, totalPages: 2 })
+  const second = (await request('/audit?page=2', { token })).body
+  const allItems = [...first.items, ...second.items]
+  assert.equal(new Set(allItems.map((item) => item.id)).size, expectedTotal)
+  assert.ok(allItems.every((item) => typeof item.description === 'string' && item.description && !item.description.includes('undefined')))
+
+  // Búsquedas sobre SQL: acción traducida, patente, autor, sin coincidencias y comodines.
+  const search = async (text) => (await request(`/audit?q=${encodeURIComponent(text)}`, { token })).body
+  assert.deepEqual((await search('renovó')).items.map((item) => item.action), ['renewed'])
+  assert.ok((await search('ZZ777ZZ')).total >= 36)
+  assert.equal((await search('JUAN PÉREZ')).total, expectedTotal)
+  assert.equal((await search('no-existe')).total, 0)
+  assert.equal((await search('%')).total, 0)
+
+  // Ficha del vehículo por cursor: completa, sin repetidos, sin otros vehículos y sin altas duplicadas.
+  const items = []
+  let cursor = null
+  let total
+  do {
+    const page = (await request(`/vehicles/${vehicle.id}/history${cursor ? `?cursor=${cursor}` : ''}`, { token })).body
+    assert.ok(page.items.length <= 20)
+    total = page.total
+    items.push(...page.items)
+    cursor = page.nextCursor
+  } while (cursor)
+  const ids = items.map((item) => item.id)
+  assert.equal(new Set(ids).size, ids.length)
+  assert.equal(ids.length, total)
+  // Alta + 35 ediciones + carga + renovación + reparación.
+  assert.equal(total, 39)
+  assert.ok(items.some((item) => item.kind === 'repair' && item.description === 'Cambio de aceite'))
+  assert.ok(items.some((item) => item.action === 'renewed'))
+  assert.ok(!ids.some((id) => id.startsWith('registered-')))
+
+  // Un vehículo sin eventos muestra sus altas sintéticas.
+  const seeded = (await request('/vehicles/vh-3/history', { token })).body
+  assert.ok(seeded.items.some((item) => item.id === 'registered-vh-3'))
+  assert.ok(seeded.items.some((item) => item.id === 'registered-doc-8'))
+  assert.equal((await request(`/vehicles/${vehicle.id}/history?cursor=roto`, { token })).status, 400)
+
+  // Eliminar el vehículo conserva su historial, que sigue siendo legible.
+  assert.equal((await request(`/vehicles/${vehicle.id}`, { method: 'DELETE', token })).status, 200)
+  const afterDelete = (await request('/audit', { token })).body
+  assert.ok(afterDelete.total > expectedTotal)
+  assert.ok(afterDelete.items.every((item) => !item.description.includes('undefined')))
 })

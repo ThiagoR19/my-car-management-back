@@ -45,7 +45,7 @@ export const databaseAudits = {
 export const memoryAudits = {
   async list(store, { page = 1, pageSize = AUDIT_PAGE_SIZE, search = '', entities = [], actions = [] } = {}) {
     const needle = normalize(search)
-    const items = (store.audit || []).filter((item) => !needle || entities.includes(item.entity) || actions.includes(item.action) || normalize([item.employeeName, item.employeeEmail, item.action, item.entity, item.entityId, JSON.stringify(item.data ?? null)].join(' ')).includes(needle))
+    const items = (store.audit || []).filter((item) => !needle || entities.includes(item.entity) || actions.includes(item.action) || [item.employeeName, item.employeeEmail, item.action, item.entity, item.entityId, JSON.stringify(item.data ?? null)].some((value) => normalize(value).includes(needle)))
     const size = Math.min(AUDIT_MAX_PAGE_SIZE, Math.max(1, pageSize))
     const totalPages = Math.max(1, Math.ceil(items.length / size))
     const current = Math.min(totalPages, Math.max(1, page))
